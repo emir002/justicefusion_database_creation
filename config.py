@@ -174,6 +174,9 @@ LLM_RETRY_WAIT_INITIAL = 2  # seconds
 LLM_RETRY_WAIT_MULTIPLIER = 2
 LLM_RETRY_WAIT_MAX = 60     # seconds
 LLM_MAX_RETRIES_PER_ITEM = 3  # Added from discussion, max retries for a specific LLM task on an item (e.g. summary for one chunk)
+LLM_MAX_RETRIES = LLM_MAX_RETRIES_PER_ITEM
+LLM_BACKOFF_BASE_SECONDS = 0.8
+OLLAMA_JSON_MODE_FOR_ENTITY_EXTRACTION = True
 logger.info(
     f"LLM Rate Limits: {LLM_RATE_LIMIT_PER_MINUTE}/min per key, {LLM_DAILY_LIMIT_PER_KEY}/day per key. "
     f"Call Retries: {LLM_RETRY_ATTEMPTS} attempts. Max item retries: {LLM_MAX_RETRIES_PER_ITEM}"
