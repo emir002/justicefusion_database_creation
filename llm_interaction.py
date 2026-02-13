@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+# llm_interaction.py
+
+import time
+import json
+import logging  # Standard library import
+import threading
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import hashlib  # For hashing API keys
+import requests, textwrap  # NEW  (place after the existing imports)
+
+# Initialize logger early
+logger = logging.getLogger(__name__)
+
+# Third-party libraries
+# NOTE: In **local-only** mode we should be able to run without Google SDKs installed.
+try:
+    # ──► prebacujemo se na novi Google GenAI SDK (google-genai ≥ 1.0.0)
+    from google import genai  # type: ignore
+    from google.genai.errors import ClientError  # type: ignore
+
+    # Attempt to import FinishReason and GenerateContentConfig directly from the new SDK's typical location
+    try:
+        from google.genai.types import FinishReason, GenerateContentConfig  # type: ignore
+        logger.info("Successfully imported FinishReason and GenerateContentConfig from google.genai.types")
+    except ImportError:
+        FinishReason = None  # type: ignore
+        GenerateContentConfig = None  # type: ignore
+        logger.error(
+            "Failed to import FinishReason or GenerateContentConfig from google.genai.types. "
+            "Ensure the 'google-genai' SDK (version 1.0.0 or later) is correctly installed and up to date. "
+            "The script will attempt to proceed but may have compatibility issues."
+        )
+        if GenerateContentConfig is None and hasattr(genai, 'types') and hasattr(genai.types, 'GenerateContentConfig'):
+            GenerateContentConfig = genai.types.GenerateContentConfig  # type: ignore
+            logger.info("Fallback: obtained GenerateContentConfig via genai.types.GenerateContentConfig")
+
+    from google.api_core.exceptions import (  # type: ignore
+        ResourceExhausted, ServiceUnavailable, GoogleAPIError,
+        InternalServerError, DeadlineExceeded, Aborted
+    )
+
+except ImportError as e_google:
+    # Google SDK is unavailable. This is OK in local mode.
+    genai = None  # type: ignore
+    ClientError = Exception  # type: ignore
+    FinishReason = None  # type: ignore
+    GenerateContentConfig = None  # type: ignore
+
+    # Define placeholder exception types so retry config / isinstance checks still work.
+    ResourceExhausted = ServiceUnavailable = GoogleAPIError = InternalServerError = DeadlineExceeded = Aborted = Exception  # type: ignore
+
+    logger.warning(
+        f"Google GenAI SDK not available ({type(e_google).__name__}: {e_google}). "
+        "External Gemini calls will be disabled; local-only mode can still run."
+    )
+from tenacity import (
+    retry, stop_after_attempt, wait_exponential,
+    retry_if_exception_type, before_sleep_log, retry_if_exception
+)
+from filelock import FileLock, Timeout  # For inter-process file locking
+
+# Local imports
+import config  # For API keys, model name, rate limits
+import utils   # For safe_json_loads
+import metrics # For LLM call metrics
+
+# --- Constants ---
+LLM_RETRYABLE_ERRORS = (
+    ResourceExhausted,
+    ServiceUnavailable,
+    InternalServerError,
+    DeadlineExceeded,
+    Aborted,
+    ClientError,
+)
+
+# Constants for enhanced FinishReason handling
+SAFETY_RELATED_ENUM_MEMBER_NAMES = [
+    "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "IMAGE_SAFETY", "RECITATION", "SPII"
+    # Add other known safety-related enum *names* if necessary
+]
+SAFETY_RELATED_STRINGS = {
+    "SAFETY", "BLOCKED", "PROHIBITED_CONTENT", "BLOCKLIST", "IMAGE_SAFETY", "SPII_BLOCK", "RECITATION_ACTION"
+}  # Checked case-insensitively
+KNOWN_SAFETY_INTEGER_CODES = {
+    3: "SAFETY",
+    4: "RECITATION",
+    # Add other known integer codes that signify a safety block if identified.
+    # These are less likely with the new SDK if FinishReason enum is correctly used by the SDK.
+}
+
+
+# --- LLM Rate Limit State Management ---
+class RateLimitState:
+    """
+    Manages the rate limit state for API keys, persisting to a file.
+    Uses FileLock for process-safety and RLock for thread-safety of in-memory state.
+    API keys are hashed for storage.
+    """
+    def __init__(self, state_file_path: str):
+        self.state_file = Path(state_file_path)
+        self.file_lock_path = self.state_file.with_suffix(self.state_file.suffix + '.lock')
+        self.file_lock = FileLock(self.file_lock_path, timeout=10)
+        self.memory_lock = threading.RLock()
+        self.state: Dict[str, Dict[str, Any]] = self._load_state()
+        logger.info(f"RateLimitState initialized. Loaded state for {len(self.state)} keys from '{self.state_file}'.")
+
+    def _get_key_hash(self, api_key: str) -> str:
+        return hashlib.sha256(f"{api_key}:{len(api_key)}".encode('utf-8')).hexdigest()
+
+    def _load_state(self) -> Dict[str, Dict[str, Any]]:
+        logger.debug(f"Attempting to load rate limit state from: {self.state_file}")
+        try:
+            with self.file_lock:
+                if self.state_file.exists():
+                    with self.state_file.open("r", encoding='utf-8') as f:
+                        loaded_state = json.load(f)
+                    logger.info(f"Successfully loaded rate limit state from {self.state_file} for {len(loaded_state)} keys.")
+                    return loaded_state
+                else:
+                    logger.warning(f"Rate limit state file '{self.state_file}' not found. Starting fresh.")
+                    return {}
+        except Timeout:
+            logger.error(f"Timeout acquiring file lock for loading state from {self.state_file}. Returning empty state.")
+            return {}
+        except Exception as e:
+            logger.error(f"Error loading state from {self.state_file}: {e}. Starting fresh.", exc_info=True)
+            return {}
+
+    def _save_state(self):
+        logger.debug(f"Attempting to save rate limit state to: {self.state_file} for {len(self.state)} keys.")
+        try:
+            with self.file_lock:
+                with self.state_file.open("w", encoding='utf-8') as f:
+                    json.dump(self.state, f, indent=4)
+        except Timeout:
+            logger.error(f"Timeout acquiring file lock for saving state to {self.state_file}.")
+        except Exception as e:
+            logger.error(f"Error saving state to {self.state_file}: {e}", exc_info=True)
+
+    def _ensure_and_refresh_key_state(self, key_hash: str, now: float):
+        if key_hash not in self.state:
+            logger.info(f"Initializing new rate limit state for API key hash: {key_hash[:12]}...")
+            self.state[key_hash] = {
+                "minute_window_start": now,
+                "requests_in_current_minute": 0,
+                "token_minute_window_start": now,
+                "tokens_in_current_minute": 0,
+                "total_requests_today": 0,
+                "last_day_reset": now,
+                "blocked_until": 0.0
+            }
+        key_state_data = self.state[key_hash]
+        key_state_data.setdefault("token_minute_window_start", now)
+        key_state_data.setdefault("tokens_in_current_minute", 0)
+        key_state_data.setdefault("minute_window_start", now)
+        key_state_data.setdefault("requests_in_current_minute", 0)
+        key_state_data.setdefault("total_requests_today", 0)
+        key_state_data.setdefault("last_day_reset", now)
+        if now - key_state_data.get("last_day_reset", 0.0) >= 24 * 3600:
+            logger.info(f"Refreshing daily window for key hash {key_hash[:12]}.")
+            key_state_data["total_requests_today"] = 0
+            key_state_data["last_day_reset"] = now
+            key_state_data["requests_in_current_minute"] = 0
+            key_state_data["minute_window_start"] = now
+            key_state_data["tokens_in_current_minute"] = 0
+            key_state_data["token_minute_window_start"] = now
+        elif now - key_state_data.get("minute_window_start", 0.0) >= 60:
+            logger.debug(f"Refreshing minute window for key hash {key_hash[:12]}.")
+            key_state_data["requests_in_current_minute"] = 0
+            key_state_data["minute_window_start"] = now
+        if now - key_state_data.get("token_minute_window_start", 0.0) >= 60:
+            logger.debug(f"Refreshing token minute window for key hash {key_hash[:12]}.")
+            key_state_data["tokens_in_current_minute"] = 0
+            key_state_data["token_minute_window_start"] = now
+
+    def get_key_state(self, api_key: str) -> Dict[str, Any]:
+        key_hash = self._get_key_hash(api_key)
+        with self.memory_lock:
+            now = time.time()
+            self._ensure_and_refresh_key_state(key_hash, now)
+            return dict(self.state[key_hash])
+
+    def update_key_state(self, api_key: str, new_values: Dict[str, Any]):
+        key_hash = self._get_key_hash(api_key)
+        with self.memory_lock:
+            if key_hash not in self.state:
+                now = time.time()
+                self._ensure_and_refresh_key_state(key_hash, now)
+            self.state[key_hash].update(new_values)
+            self._save_state()
+
+    def increment(self, api_key: str):
+        self.record_usage(api_key, 0)
+
+    def record_usage(self, api_key: str, tokens_used: int):
+        with self.memory_lock:
+            key_hash = self._get_key_hash(api_key)
+            log_key_hash = key_hash[:12]
+            now = time.time()
+            self._ensure_and_refresh_key_state(key_hash, now)
+            key_state = self.state[key_hash]
+            key_state["requests_in_current_minute"] += 1
+            key_state["total_requests_today"] += 1
+            if tokens_used:
+                key_state["tokens_in_current_minute"] = key_state.get("tokens_in_current_minute", 0) + max(0, int(tokens_used))
+            self._save_state()
+            logger.debug(
+                f"Key hash {log_key_hash}: RPM {key_state['requests_in_current_minute']}/{config.LLM_RATE_LIMIT_PER_MINUTE}, "
+                f"TPM {key_state.get('tokens_in_current_minute', 0)}/{getattr(config, 'LLM_TOKEN_LIMIT_PER_MINUTE', '∞')}, "
+                f"RPD {key_state['total_requests_today']}/{config.LLM_DAILY_LIMIT_PER_KEY}"
+            )
+
+rate_limit_manager = RateLimitState(str(config.RATE_LIMIT_STATE_FILE))
+
+class GlobalQuotaExceeded(Exception):
+    """Raised when the project-wide daily quota for a model is exhausted."""
+
+
+# --- Tenacity Retry Helper ---
+def _is_project_quota(exc: Exception) -> bool:
+    return isinstance(exc, GlobalQuotaExceeded)
+
+
+class LLMManager:
+    def __init__(self, api_keys: List[str], model_name: str):
+        # NEW: Support local-only mode via config.LLM_MODE.
+        # In local mode, we do NOT require API keys and we route all calls to Ollama.
+        self.llm_mode = getattr(config, "LLM_MODE", "external").strip().lower()
+
+        logger.info(
+            f"Initializing LLMManager | mode={self.llm_mode} | external_model={model_name} | keys={len(api_keys)}"
+        )
+
+        self.api_keys = api_keys or []
+        self.model_name = model_name
+
+        if self.llm_mode != "local":
+            if genai is None:
+                logger.error(
+                    "LLMManager is in external mode but Google GenAI SDK is not installed/available. "
+                    "Install 'google-genai' (and dependencies) or switch config.LLM_MODE='local'."
+                )
+                raise ImportError("google-genai SDK is required for external LLM mode")
+            if not self.api_keys:
+                logger.error("No Gemini API keys provided (external mode). LLMManager cannot function.")
+                raise ValueError("No Gemini API keys provided in configuration.")
+        self.key_index = 0
+        self.key_rotation_lock = threading.Lock()
+        # ▶ Cache za Client instance (jedna po API key-u)
+        self._clients: Dict[str, "genai.Client"] = {}
+        # model-name  ->  unix epoch (float) until which *all* keys are blocked
+        self._model_blocked_until: Dict[str, float] = {}
+        # Circuit-breaker cool-down for Gemini
+        self._primary_unavailable_until = 0.0
+        if self.llm_mode != "local" and GenerateContentConfig is None:  # Only relevant in external mode
+            logger.critical("GenerateContentConfig from google.genai.types could not be imported. LLM calls may fail.")
+        logger.info(f"LLMManager initialized for model '{self.model_name}'. Key rotation starts with index 0.")
+
+        self._daily_limit = getattr(config, "LLM_DAILY_LIMIT_PER_KEY", None)
+        self._token_limit = getattr(config, "LLM_TOKEN_LIMIT_PER_MINUTE", None)
+        self._daily_window_seconds = 24 * 3600
+        if self._daily_limit:
+            logger.info(
+                f"Per-key rolling 24h limit enabled: {self._daily_limit} calls per key."
+            )
+        if self._token_limit:
+            logger.info(
+                f"Per-key input token limit enabled: {self._token_limit} tokens/minute per key."
+            )
+
+    def _estimate_input_tokens(self, prompt: str) -> int:
+        """Rough heuristic for counting prompt tokens for rate tracking."""
+        if not prompt:
+            return 0
+        # Gemini tokens roughly align to ~4 characters per token for mixed text.
+        estimated = max(1, int(len(prompt) / 4))
+        # account for whitespace-heavy prompts by adding newline count bonus
+        estimated += prompt.count("\n")
+        return estimated
+
+    def _get_key_hash_for_logging(self, api_key: str) -> str:
+        return rate_limit_manager._get_key_hash(api_key)[:12]
+
+    def _get_next_available_key(self, model: str) -> Optional[str]:
+        # --- NEW global breaker -------------------------------
+        block_until = self._model_blocked_until.get(model, 0)
+        if time.time() < block_until:
+            logger.debug(
+                "Model %s globally blocked for %.0fs", model, block_until - time.time()
+            )
+            return None
+        # ------------------------------------------------------
+        with self.key_rotation_lock:
+            num_keys = len(self.api_keys)
+            if num_keys == 0:
+                return None
+            start_idx = self.key_index
+            for i in range(num_keys):
+                current_key_to_try_idx = (start_idx + i) % num_keys
+                api_key = self.api_keys[current_key_to_try_idx]
+                log_key_hash = self._get_key_hash_for_logging(api_key)
+
+                key_state = rate_limit_manager.get_key_state(api_key)
+                now = time.time()
+                if key_state.get("blocked_until", 0.0) > now:
+                    logger.debug(f"Key hash {log_key_hash} is blocked for another {key_state['blocked_until'] - now:.1f}s. Trying next.")
+                    continue
+                if key_state.get("requests_in_current_minute", 0) >= config.LLM_RATE_LIMIT_PER_MINUTE:
+                    wait_time = 60.0 - (now - key_state.get("minute_window_start", now))
+                    new_blocked_until = now + max(0, wait_time) + 1
+                    logger.warning(f"Minute limit for key hash {log_key_hash}. Blocking for {new_blocked_until - now:.1f}s.")
+                    rate_limit_manager.update_key_state(api_key, {"blocked_until": new_blocked_until})
+                    continue
+                if self._token_limit and key_state.get("tokens_in_current_minute", 0) >= self._token_limit:
+                    wait_time = 60.0 - (now - key_state.get("token_minute_window_start", now))
+                    new_blocked_until = now + max(0, wait_time) + 1
+                    logger.warning(
+                        f"Token limit for key hash {log_key_hash}. Blocking for {new_blocked_until - now:.1f}s."
+                    )
+                    rate_limit_manager.update_key_state(api_key, {"blocked_until": new_blocked_until})
+                    continue
+                if self._daily_limit and key_state.get("total_requests_today", 0) >= self._daily_limit:
+                    reset_at = key_state.get("last_day_reset", now) + self._daily_window_seconds
+                    wait_time = max(0.0, reset_at - now)
+                    logger.warning(
+                        f"Daily limit reached for key hash {log_key_hash}. Blocking for {wait_time:.0f}s until window resets."
+                    )
+                    rate_limit_manager.update_key_state(api_key, {"blocked_until": reset_at})
+                    continue
+                self.key_index = current_key_to_try_idx
+                logger.debug(f"Selected API key index {self.key_index} (hash: {log_key_hash}) for LLM call.")
+                return api_key
+            logger.error("All API keys are currently rate-limited or blocked after checking all keys.")
+            return None
+
+    def _increment_counters(self, api_key: str, tokens_used: int):
+        rate_limit_manager.record_usage(api_key, tokens_used)
+
+    # ----------------------------------------------------------
+    # centralised error parser that can trip per-key blocks
+    # ----------------------------------------------------------
+    def _handle_client_error(self, err: ClientError, model: str, api_key: str) -> bool:
+        """
+        Returns True if the error was a *project-level per-model daily quota* hit for this key.
+        In that case, we block just this key for 24 hours and try another key.
+        """
+        if getattr(err, "status_code", None) != 429:
+            return False
+
+        # New SDK (>=1.0) – the JSON is in err.response
+        payload = getattr(err, "response", None)
+        if not payload:
+            payload = err.args[1] if len(err.args) > 1 else None
+        if not isinstance(payload, dict):
+            return False  # can't parse → give up
+
+        try:
+            for d in payload.get("error", {}).get("details", []):
+                if d.get("@type", "").endswith("QuotaFailure"):
+                    for v in d.get("violations", []):
+                        if v.get("quotaId", "").startswith(
+                            "GenerateRequestsPerDayPerProjectPerModel"
+                        ):
+                            # This key's project is exhausted for this model for today.
+                            # Block ONLY this key until the rolling 24h window expires and signal caller to try another key.
+                            cooldown = time.time() + self._daily_window_seconds
+                            rate_limit_manager.update_key_state(api_key, {"blocked_until": cooldown})
+
+                            log_key_hash = self._get_key_hash_for_logging(api_key)
+                            logger.warning(
+                                "Per-project per-model daily quota exhausted for key hash %s; "
+                                "blocking this key for 24h.", log_key_hash
+                            )
+                            return True
+        except (IndexError, AttributeError, KeyError, TypeError):
+            logger.debug("Could not parse project quota details from ClientError.", exc_info=True)
+
+        return False
+
+
+    @retry(
+        stop=stop_after_attempt(config.LLM_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=config.LLM_RETRY_WAIT_MULTIPLIER,
+            min=config.LLM_RETRY_WAIT_INITIAL,
+            max=config.LLM_RETRY_WAIT_MAX,
+        ),
+        retry=retry_if_exception(
+            lambda e: not _is_project_quota(e)                # ① skip GlobalQuotaExceeded
+            and isinstance(e, LLM_RETRYABLE_ERRORS)           # ② retry only for allowed errors
+        ),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    def _generate_content_with_retry(self, prompt: str,
+                                     temperature: float = 0.5,
+                                     max_output_tokens: Optional[int] = None) -> Optional[str]:
+
+            # -----------------------------------------------------------------
+            # LOCAL-ONLY MODE: always use Ollama
+            # -----------------------------------------------------------------
+            if self.llm_mode == "local":
+                local_temp = temperature if temperature is not None else getattr(config, "LOCAL_LLM_TEMPERATURE", 0.5)
+                result = self._call_ollama(prompt, local_temp, max_output_tokens)
+                if result is None:
+                    return "Error: Ollama request failed (no response)."
+                return result
+
+            now = time.time()
+
+            # Are we in the cool-down window?
+            if now < self._primary_unavailable_until:
+                # -> Directly use Ollama
+                logger.info("Gemini is still cooling-down; using Ollama fallback.")
+                return self._call_ollama(prompt, temperature, max_output_tokens)
+
+            # Try Gemini keys; if none available, use Ollama
+            tried_any_key = False
+            while True:
+                api_key = self._get_next_available_key(self.model_name)
+                if not api_key:
+                    logger.warning("No Gemini keys available – switching to Ollama.")
+                    # Cool down briefly so minute windows can reset quickly
+                    self._primary_unavailable_until = time.time() + 65.0
+                    return self._call_ollama(prompt, temperature, max_output_tokens)
+
+                tried_any_key = True
+                log_key_hash = self._get_key_hash_for_logging(api_key)
+                logger.info(f"Attempting LLM call with key hash {log_key_hash} for model '{self.model_name}'. Prompt (first 70 chars): '{prompt[:70].replace(chr(10), ' ')}...'")
+
+                if GenerateContentConfig is None:
+                    logger.error("GenerateContentConfig is not available (failed import). Cannot make LLM call.")
+                    return "Error: System configuration issue (GenerateContentConfig missing)."
+
+                try:
+                    # ──► Dohvati ili kreiraj client za dani ključ
+                    if api_key not in self._clients:
+                        self._clients[api_key] = genai.Client(api_key=api_key)
+                    client = self._clients[api_key]
+
+                    cfg_kwargs = {"temperature": temperature}
+                    if max_output_tokens is not None:
+                        cfg_kwargs["max_output_tokens"] = max_output_tokens
+
+                    safety_settings_list = [
+                        genai.types.SafetySetting(
+                            category="HARM_CATEGORY_HARASSMENT",
+                            threshold="BLOCK_MEDIUM_AND_ABOVE",
+                        ),
+                        genai.types.SafetySetting(
+                            category="HARM_CATEGORY_HATE_SPEECH",
+                            threshold="BLOCK_MEDIUM_AND_ABOVE",
+                        ),
+                        genai.types.SafetySetting(
+                            category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                            threshold="BLOCK_MEDIUM_AND_ABOVE",
+                        ),
+                        genai.types.SafetySetting(
+                            category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                            threshold="BLOCK_MEDIUM_AND_ABOVE",
+                        ),
+                    ]
+
+                    # ➊ GenerateContentConfig – jedini „dozvoljen” način slanja parametara ​i​ safety_settings-a
+                    current_generation_config = (
+                        GenerateContentConfig(**cfg_kwargs, safety_settings=safety_settings_list)
+                        if GenerateContentConfig
+                        else {**cfg_kwargs, "safety_settings": safety_settings_list}
+                    )
+
+                    # ---- bump counters *before* we hit the network so 429s are tracked ----
+                    estimated_input_tokens = self._estimate_input_tokens(prompt)
+                    if max_output_tokens:
+                        estimated_input_tokens += max_output_tokens
+                    self._increment_counters(api_key, estimated_input_tokens)
+                    start_time = time.time()
+                    response = client.models.generate_content(
+                        model=self.model_name,
+                        contents=[prompt],
+                        config=current_generation_config,
+                    )
+                    latency = time.time() - start_time
+                    metrics.LLM_LATENCY.labels(endpoint=self.model_name).observe(latency)
+                    logger.info(f"LLM call with key hash {log_key_hash} completed in {latency:.2f}s.")
+
+                    generated_text_content = None
+                    if response.candidates:
+                        for candidate_idx, candidate in enumerate(response.candidates):
+                            finish = getattr(candidate, "finish_reason", None)
+                            is_safety_block = False
+                            finish_value_for_comparison = None
+                            finish_name_for_comparison = None
+
+                            if finish is not None:
+                                if hasattr(finish, 'value') and isinstance(finish.value, int):
+                                    finish_value_for_comparison = finish.value
+                                if hasattr(finish, 'name') and isinstance(finish.name, str):
+                                    finish_name_for_comparison = finish.name.upper()  # Compare uppercase
+
+                                if FinishReason is None:  # Log raw details only if our main Enum import failed
+                                    logger.info(
+                                        f"FinishReason enum not imported. Candidate {candidate_idx} raw finish_reason: {finish} "
+                                        f"(name: {finish_name_for_comparison}, value: {finish_value_for_comparison}, type: {type(finish)})"
+                                    )
+
+                                # Check for safety block
+                                if FinishReason and isinstance(finish, FinishReason):  # Primary check with imported Enum
+                                    if hasattr(finish, 'name') and finish.name in SAFETY_RELATED_ENUM_MEMBER_NAMES:
+                                        is_safety_block = True
+                                elif finish_name_for_comparison and finish_name_for_comparison in SAFETY_RELATED_STRINGS:  # Fallback to string name
+                                    is_safety_block = True
+                                elif finish_value_for_comparison is not None and finish_value_for_comparison in KNOWN_SAFETY_INTEGER_CODES:  # Fallback to int value
+                                    is_safety_block = True
+                                    logger.info(f"Candidate {candidate_idx}: Interpreted integer finish_reason value {finish_value_for_comparison} as safety-related: {KNOWN_SAFETY_INTEGER_CODES[finish_value_for_comparison]}")
+
+                            if is_safety_block:
+                                safety_ratings_str = str(getattr(candidate, 'safety_ratings', 'N/A'))
+                                logger.warning(f"Candidate {candidate_idx} for key hash {log_key_hash} blocked due to safety. Finish Reason: {finish}. Ratings: {safety_ratings_str}")
+                                continue
+
+                            if candidate.content and candidate.content.parts:
+                                try:
+                                    part_text = candidate.content.parts[0].text
+                                    if isinstance(part_text, str):
+                                        generated_text_content = part_text
+                                        logger.debug(f"Using text from candidate {candidate_idx} for key hash {log_key_hash}.")
+                                        break
+                                    else:
+                                        logger.warning(f"Candidate {candidate_idx} part 0 text is not a string: {type(part_text)}")
+                                except IndexError:
+                                    logger.warning(f"Candidate {candidate_idx} content.parts was empty for key hash {log_key_hash}.")
+                                except AttributeError:
+                                    logger.warning(f"Candidate {candidate_idx} content.parts[0] did not have 'text' attribute for key hash {log_key_hash}.")
+                            else:
+                                log_name = 'N/A'
+                                if finish is not None:
+                                    if FinishReason and isinstance(finish, FinishReason) and hasattr(finish, 'name'):
+                                        log_name = finish.name
+                                    elif finish_name_for_comparison:  # From string name
+                                        log_name = finish_name_for_comparison
+                                    elif finish_value_for_comparison is not None:  # From int value
+                                        log_name = f"VALUE_{finish_value_for_comparison}"
+                                    else:  # Fallback to raw string of finish object
+                                        log_name = str(finish)
+                                logger.warning(f"Candidate {candidate_idx} for key hash {log_key_hash} has no content/parts. Finish Reason: {log_name}")
+
+                    if generated_text_content is not None:
+                        result_text = generated_text_content.strip()
+                        metrics.LLM_CALLS.labels(endpoint=self.model_name, status='success').inc()
+                        return result_text
+                    else:
+                        block_reason_msg = "No usable text from any candidate"
+                        if response.prompt_feedback and response.prompt_feedback.block_reason:
+                            block_reason_val = response.prompt_feedback.block_reason
+                            block_reason_msg = f"Prompt blocked due to: {block_reason_val.name if hasattr(block_reason_val, 'name') else block_reason_val}"
+                            if response.prompt_feedback.block_reason_message:
+                                block_reason_msg += f" - {response.prompt_feedback.block_reason_message}"
+                        elif response.candidates and getattr(response.candidates[0], "finish_reason", None) is not None:
+                            first_cand = response.candidates[0]
+                            finish_val_cand = getattr(first_cand, "finish_reason", None)
+
+                            log_name_cand = 'N/A'
+                            if finish_val_cand is not None:
+                                if FinishReason and isinstance(finish_val_cand, FinishReason) and hasattr(finish_val_cand, 'name'):
+                                    log_name_cand = finish_val_cand.name
+                                elif hasattr(finish_val_cand, 'name') and isinstance(finish_val_cand.name, str):  # Check if it has .name directly
+                                    log_name_cand = finish_val_cand.name
+                                elif hasattr(finish_val_cand, 'value') and isinstance(finish_val_cand.value, int):
+                                    log_name_cand = f"VALUE_{finish_val_cand.value}"
+                                else:
+                                    log_name_cand = str(finish_val_cand)
+                            block_reason_msg = f"First candidate finish_reason: {log_name_cand}"
+                            safety_ratings_str = str(getattr(first_cand, 'safety_ratings', 'N/A'))
+                            if getattr(first_cand, 'safety_ratings', None):
+                                block_reason_msg += f", SafetyRatings: {safety_ratings_str}"
+
+                        logger.warning(f"LLM response (key hash {log_key_hash}) provided no usable text. {block_reason_msg}. Prompt: '{prompt[:70]}...'")
+                        metrics.LLM_CALLS.labels(endpoint=self.model_name, status='blocked_or_empty').inc()
+                        return f"Error: Content generation failed. Reason: {block_reason_msg}"
+
+                except ClientError as e_client:
+                    # If this was a per-project per-model daily quota for THIS KEY, block it and try next key.
+                    quota_exhausted_for_key = self._handle_client_error(e_client, self.model_name, api_key)
+
+                    # Mark the specific key as rate-limited for a short duration for generic 429/RESOURCE_EXHAUSTED
+                    if getattr(e_client, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e_client):
+                        rate_limit_manager.update_key_state(
+                            api_key, {"blocked_until": time.time() + 65.0}
+                        )
+
+                    if quota_exhausted_for_key:
+                        logger.info("Key exhausted its project-level per-model daily quota; trying another key.")
+                        # Try another key immediately (no long global cool-down)
+                        continue
+
+                    logger.warning(f"Gemini ClientError, falling back to Ollama. Error: {e_client}")
+                    self._primary_unavailable_until = time.time() + config.PRIMARY_LLM_COOLDOWN
+                    # Do not re-raise; fall through to Ollama
+                    return self._call_ollama(prompt, temperature, max_output_tokens)
+
+                except LLM_RETRYABLE_ERRORS as e_retry:
+                    metrics.LLM_CALLS.labels(endpoint=self.model_name, status='retryable_error').inc()
+                    logger.warning(f"LLM call (key hash {log_key_hash}) failed with retryable error: {type(e_retry).__name__} - {e_retry}. Falling back to Ollama.")
+                    if isinstance(e_retry, ResourceExhausted):
+                        rate_limit_manager.update_key_state(api_key, {"blocked_until": time.time() + 65.0})
+                    self._primary_unavailable_until = time.time() + config.PRIMARY_LLM_COOLDOWN
+                    # Do not re-raise; fall through to Ollama
+                    return self._call_ollama(prompt, temperature, max_output_tokens)
+
+                except GoogleAPIError as e_google:
+                    metrics.LLM_CALLS.labels(endpoint=self.model_name, status='api_error').inc()
+                    logger.error(f"LLM call (key hash {log_key_hash}) failed: Non-retryable GoogleAPIError: {type(e_google).__name__} - {e_google}. Falling back to Ollama.", exc_info=True)
+                    self._primary_unavailable_until = time.time() + config.PRIMARY_LLM_COOLDOWN
+                    # Do not return an error string; fall through to Ollama
+                    return self._call_ollama(prompt, temperature, max_output_tokens)
+
+                except Exception as e_unexpected:
+                    metrics.LLM_CALLS.labels(endpoint=self.model_name, status='other_error').inc()
+                    logger.error(f"LLM call (key hash {log_key_hash}) failed: Unexpected error: {type(e_unexpected).__name__} - {e_unexpected}", exc_info=True)
+                    return f"Error: Unexpected error during LLM call: {type(e_unexpected).__name__}"
+
+    # ─── LOCAL OLLAMA FALLBACK ────────────────────────────────────────────────────
+    def _call_ollama(self, prompt: str,
+                     temperature: float = config.LIGHTRAG_TEMPERATURE,
+                     max_output_tokens: int | None = None) -> str | None:
+        """
+        Fire a single request to the local Ollama HTTP endpoint. Returns `str`
+        or None if something goes wrong.
+        """
+        # Prefer the new config names if present; fall back to legacy ones.
+        local_model = getattr(config, "LOCAL_LLM_MODEL_NAME", getattr(config, "LIGHTRAG_MODEL_NAME", ""))
+        ollama_url = getattr(config, "LIGHTRAG_OLLAMA_URL", None)
+        if hasattr(config, "OLLAMA_BASE_URL") and hasattr(config, "OLLAMA_GENERATE_ENDPOINT"):
+            ollama_url = f"{config.OLLAMA_BASE_URL}{config.OLLAMA_GENERATE_ENDPOINT}"
+
+        payload = {
+            "model":       local_model,
+            "prompt":      prompt,
+            "stream":      False,
+            "temperature": temperature,
+        }
+        if max_output_tokens:
+            payload["options"] = {"num_predict": max_output_tokens}
+
+        try:
+            r = requests.post(
+                ollama_url, json=payload,
+                timeout=getattr(config, "OLLAMA_TIMEOUT", 60)
+            )
+            r.raise_for_status()
+            data = r.json()
+            metrics.LLM_CALLS.labels(endpoint="ollama", status="success").inc()
+            # Ollama returns the text in `.response`
+            return textwrap.dedent(data.get("response", "")).strip()
+        except Exception as e:
+            logger.error(f"Ollama request failed: {type(e).__name__}: {e}")
+            metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
+            return None
+
+    @staticmethod
+    def _normalize_simple_answer(text: str) -> str:
+        if not text:
+            return ""
+        normalized_text = text.strip()
+        if normalized_text.upper().startswith("ANSWER:"):
+            normalized_text = normalized_text[len("ANSWER:"):].strip()
+        return normalized_text.strip('"\':()').upper()
+
+    def generate_summary(self, text: str, max_length: int = config.LLM_SUMMARY_MAX_INPUT_LENGTH) -> str:
+        logger.info(f"Request to generate summary (input original length {len(text)}, processing max_length {max_length}).")
+        truncated_text = text[:max_length]
+        if len(text) > max_length:
+            logger.warning(f"Input text for summary was truncated: {len(text)} -> {max_length} chars.")
+        prompt = f"Summarize the following document in one concise paragraph:\n\nDocument Text:\n\"\"\"\n{truncated_text}\n\"\"\"\n\nSummary:"
+        summary = self._generate_content_with_retry(prompt, temperature=0.4, max_output_tokens=512)
+        if summary and not summary.startswith("Error:"):
+            cleaned_summary = summary.strip('\"`\'')
+            logger.info(f"Summary generated successfully. Length: {len(cleaned_summary)} chars.")
+            return cleaned_summary
+        else:
+            logger.error(f"Failed to generate summary. LLM response: {summary}")
+            return summary if summary else "Error: Failed to generate summary (empty response)."
+
+    def extract_document_title(self, text: str, snippet_length: int = config.LLM_TITLE_SNIPPET_MAX_LEN) -> str:
+        logger.info(f"Request to extract title (snippet {snippet_length}, original_text_len {len(text)}).")
+        snippet = text[:snippet_length].strip()
+        if not snippet:
+            logger.warning("Cannot extract title from empty text snippet.")
+            return "Error: Empty text for title extraction."
+        prompt = f"""Based on the following text snippet, provide a concise and descriptive document title.
+If an official title is clearly present at the beginning (e.g., "ZAKON O...", "PRAVILNIK O...", "ODLUKA o..."), return that.
+Otherwise, create a suitable title.
+
+Snippet:
+---
+{snippet}
+---
+
+Title:"""
+        title = self._generate_content_with_retry(prompt, temperature=0.2, max_output_tokens=128)
+        if title and not title.startswith("Error:"):
+            cleaned_title = title.strip('"`\':').strip()
+            if cleaned_title.lower() == "unable to determine title":
+                logger.warning(f"LLM indicated 'Unable to determine title' for the snippet.")
+                return ""
+            logger.info(f"Document title extracted/generated: '{cleaned_title}'")
+            return cleaned_title
+        else:
+            logger.error(f"Failed to extract/generate document title. LLM response: {title}")
+            return title if title else "Error: Failed to extract title (empty response)."
+
+    def extract_entities_and_relationships(self, text_content: str, source_id: str, max_text_length: int = config.LLM_ENTITY_MAX_INPUT_LENGTH) -> Dict[str, List[Dict]]:
+        logger.info(f"Request to extract entities/relationships for source_id: '{source_id}' (original len {len(text_content)}, processing max {max_text_length}).")
+        truncated_text = text_content[:max_text_length]
+        if len(text_content) > max_text_length:
+            logger.warning(f"Input for entity extraction for '{source_id}' truncated: {len(text_content)} -> {max_text_length} chars.")
+        if not truncated_text.strip():
+            logger.warning(f"Cannot extract entities from empty text (source: '{source_id}').")
+            return {"nodes": [], "edges": []}
+        prompt = f"""Task: Analyze the following legal text snippet. Extract key legal entities (nodes) and their relationships (edges).
+
+Source ID (for all extracted items): "{source_id}"
+
+Text Snippet:
+---
+{truncated_text}
+---
+
+Instructions:
+1.  **Identify Legal Entities (Nodes):**
+    * Focus on specific laws, regulations, specific articles if clearly referenced (e.g., "Član 5. Zakona o radu"), official decrees, court decisions (e.g., "Presuda Suda BiH S1 2 K 012345 20"), formal judgments, specific contracts or treaties mentioned by name, important legal concepts central to the text (e.g., "pravna stečevina Europske unije"), and key institutions if they are acting in a legal capacity or are the subject of legal provisions within this snippet.
+    * For each entity, provide:
+        * `"entity_name"`: The precise name or identifier (e.g., "Zakon o parničnom postupku", "Član 15.", "Odluka Ustavnog suda U-5/20"). Normalize slightly for consistency if needed (e.g., consistent capitalization for similar entity types).
+        * `"entity_type"`: Choose from: "Law", "Regulation", "Article", "Decree", "Court Decision", "Judgment", "Contract", "Treaty", "Legal Concept", "Institution", "Official Gazette", "Amendment", "Rulebook", "Statute", "Other Legal Document".
+        * `"description"`: A brief (1-2 sentences) summary of what the entity is or its role *as presented within this specific text snippet*.
+        * `"source_id"`: Must be exactly "{source_id}".
+
+2.  **Identify Relationships (Edges):**
+    * Identify relationships *explicitly mentioned or very strongly implied* in the text snippet between the extracted entities.
+    * Examples of relationships: "amends", "repeals", "cites", "interprets", "clarifies", "applies to", "decided by", "based on", "contradicts", "supplements", "governs", "refers to".
+    * For each relationship, provide:
+        * `"source_entity"`: The `entity_name` of the source node. Must exactly match an `entity_name` from your extracted nodes list.
+        * `"target_entity"`: The `entity_name` of the target node. Must exactly match an `entity_name` from your extracted nodes list.
+        * `"relationship_type"`: A concise verb phrase describing the relationship (e.g., "amends", "cites", "is part of").
+        * `"source_id"`: Must be exactly "{source_id}".
+
+3.  **Output Format:**
+    * Return the result *ONLY* as a single, valid JSON object.
+    * The JSON object must have two top-level keys: `"nodes"` (a list of entity objects) and `"edges"` (a list of relationship objects).
+    * Example: {{"nodes": [{{"entity_name": "...", "entity_type": "...", ...}}], "edges": [{{"source_entity": "...", ...}}]}}`
+    * If no relevant entities or relationships are found in the snippet, return `{{"nodes": [], "edges": []}}`.
+    * Ensure all string values within the JSON are properly escaped. Do not include any explanations or text outside the JSON structure.
+
+JSON Output:"""
+        response_text = self._generate_content_with_retry(prompt, temperature=0.3, max_output_tokens=2048)
+        if not response_text or response_text.startswith("Error:"):
+            logger.error(f"LLM entity extraction failed for '{source_id}'. Response: {response_text}")
+            return {"nodes": [], "edges": []}
+        parsed_json = utils.safe_json_loads(response_text, source_info=f"entity extraction for '{source_id}'")
+        if parsed_json and isinstance(parsed_json.get("nodes"), list) and isinstance(parsed_json.get("edges"), list):
+            logger.info(f"Entity extraction success for '{source_id}'. Found {len(parsed_json['nodes'])} nodes, {len(parsed_json['edges'])} edges.")
+            for item_list in parsed_json.values():
+                if isinstance(item_list, list):
+                    for item in item_list:
+                        if isinstance(item, dict) and item.get("source_id") != source_id:
+                            item["source_id"] = source_id
+            return parsed_json
+        else:
+            logger.error(f"Failed to parse valid entities/relationships JSON for '{source_id}'. Response: {response_text[:500]}")
+            return {"nodes": [], "edges": []}
+
+    def classify_document(self, text_snippet: str) -> str:
+        if not text_snippet.strip():
+            logger.warning("Empty snippet for classification – defaulting to OTHER.")
+            return "OTHER"
+        prompt = f"""Analyze the following text snippet and classify it into one of three categories: LAW, MIXED, or OTHER.
+
+- **LAW**: The text is purely legislative or regulatory content (e.g., a law, regulation, statute). It consists of articles, sections, and formal legal language.
+- **MIXED**: The text contains both legislative/regulatory content AND additional commentary, analysis, news, or explanations. For example, a news article that quotes several articles of a law.
+- **OTHER**: The text is not a legal document. Examples include news reports, court summaries (not the full text of the decision), academic papers, or general web content.
+
+**TEXT SNIPPET:**
+---
+{text_snippet}
+---
+
+**OUTPUT:**
+Return only a single word: LAW, MIXED, or OTHER."""
+        reply = self._generate_content_with_retry(prompt, temperature=0.1, max_output_tokens=8)
+        if reply and not reply.startswith("Error:"):
+            ans = self._normalize_simple_answer(reply)
+            if ans in {"LAW", "MIXED", "OTHER"}:
+                logger.info(f"Document snippet classified as '{ans}'.")
+                return ans
+            logger.warning(f"Unexpected classification label '{ans}' (from raw: '{reply}') received from LLM – defaulting to OTHER.")
+        else:
+            logger.error(f"Classifier LLM failed: {reply}. Defaulting to OTHER.")
+        return "OTHER"
+
+    def is_law_document(self, text_snippet: str) -> bool:
+        """
+        Convenience helper – returns **True** when the snippet is classified
+        as purely legislative/regulatory text (LAW), otherwise **False**.
+        """
+        return self.classify_document(text_snippet) == "LAW"
