@@ -190,39 +190,58 @@ def extract_json_block(text: str) -> Optional[str]:
     return None
 
 
-def safe_json_loads(json_str: str, source_info: str = "Unknown source") -> Optional[Union[Dict[str, Any], List[Any]]]:
-    """Safely loads a JSON string, with an attempt to repair it if initial parsing fails."""
+def safe_json_loads(json_str: str, source_info: str = "Unknown source") -> Union[Dict[str, Any], List[Any]]:
+    """Safely loads a JSON string with layered fallbacks for wrapped/malformed model output."""
     if not json_str or not json_str.strip():
         logger.warning(f"Received empty or whitespace-only JSON string from {source_info}. Cannot parse.")
-        return None
+        return {}
 
     cleaned_json_str = json_str.strip()
+    # Remove markdown fences early
+    if cleaned_json_str.startswith("```"):
+        cleaned_json_str = re.sub(r"^```(?:json)?\s*", "", cleaned_json_str, flags=re.IGNORECASE)
+        cleaned_json_str = re.sub(r"\s*```$", "", cleaned_json_str).strip()
+
     try:
         return json.loads(cleaned_json_str)
     except json.JSONDecodeError as e:
         extracted_json_str = extract_json_block(cleaned_json_str)
-        if extracted_json_str and extracted_json_str != cleaned_json_str:
+        if extracted_json_str:
             try:
                 return json.loads(extracted_json_str)
             except json.JSONDecodeError:
                 pass
 
+        # object substring fallback
+        obj_start, obj_end = cleaned_json_str.find("{"), cleaned_json_str.rfind("}")
+        if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+            try:
+                return json.loads(cleaned_json_str[obj_start:obj_end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        # array substring fallback
+        arr_start, arr_end = cleaned_json_str.find("["), cleaned_json_str.rfind("]")
+        if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+            try:
+                return json.loads(cleaned_json_str[arr_start:arr_end + 1])
+            except json.JSONDecodeError:
+                pass
+
         logger.warning(f"Standard JSON parsing failed for {source_info}: {e}. Attempting to repair with json_repair.")
         try:
-            repaired_json_str = repair_json(extracted_json_str or cleaned_json_str)
-            # Ensure the repaired string is actually valid JSON before returning
-            # by parsing it again. repair_json can sometimes return non-string or invalid structures.
+            repair_target = extracted_json_str or cleaned_json_str
+            repaired_json_str = repair_json(repair_target)
             if isinstance(repaired_json_str, str):
                 parsed = json.loads(repaired_json_str)
                 logger.info(f"JSON parsing for {source_info} succeeded after json_repair.")
                 return parsed
-            else: # Should not happen if repair_json works as expected (returns string)
-                logger.error(f"JSON repair for {source_info} did not return a string. Type: {type(repaired_json_str)}. Data: {str(repaired_json_str)[:100]}")
-                return None # Or handle as appropriate
+            logger.error(f"JSON repair for {source_info} did not return a string. Type: {type(repaired_json_str)}")
+            return {}
         except Exception as repair_e:
             logger.error(f"JSON repair also failed for {source_info}. Original decode error: {e}, Repair error: {repair_e}", exc_info=True)
-            logger.debug(f"Original problematic JSON string from {source_info} (first 500 chars):\n{json_str.strip()[:500]}") # Log original non-cleaned
-            return None
+            logger.debug(f"Original problematic JSON string from {source_info} (first 500 chars):\n{json_str.strip()[:500]}")
+            return {}
 
 # --- File Hashing ---
 def get_file_hash(file_path: Path, algorithm: str = 'md5') -> Optional[str]:

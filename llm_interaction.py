@@ -775,19 +775,6 @@ class LLMManager:
         return cleaned.strip("` \n")
 
     @staticmethod
-    def _is_effectively_empty(text: Optional[str]) -> bool:
-        if text is None:
-            return True
-        return str(text).strip().lower() in {"", "null", "none", "n/a", "na"}
-
-    @staticmethod
-    def _strip_markdown_wrappers(text: str) -> str:
-        cleaned = (text or "").strip()
-        cleaned = re.sub(r"^```(?:[a-zA-Z0-9_-]+)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        return cleaned.strip("` \n")
-
-    @staticmethod
     def _normalize_simple_answer(text: str) -> str:
         if not text:
             return ""
@@ -867,7 +854,57 @@ Title:"""
         logger.warning(f"Failed to extract/generate title from LLM; fallback='{fallback}'")
         return fallback
 
-    def extract_entities_and_relationships(self, text_content: str, source_id: str, max_text_length: int = config.LLM_ENTITY_MAX_INPUT_LENGTH) -> Dict[str, List[Dict]]:
+    def normalize_graph_payload(self, payload: Dict[str, Any], source_id: str, source_filename: str = "") -> Dict[str, List[Dict[str, str]]]:
+        """Normalize heterogeneous LLM graph output to canonical node/edge schemas."""
+        if not isinstance(payload, dict):
+            return {"nodes": [], "edges": []}
+
+        raw_nodes = payload.get("nodes")
+        raw_edges = payload.get("edges")
+        if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
+            return {"nodes": [], "edges": []}
+
+        normalized_nodes: List[Dict[str, str]] = []
+        for idx, node in enumerate(raw_nodes):
+            if not isinstance(node, dict):
+                logger.warning(f"Skipping non-dict node at index {idx} for source_id={source_id}.")
+                continue
+            node_id = str(node.get("node_id") or node.get("id") or node.get("nodeId") or "").strip()
+            node_name = str(node.get("node_name") or node.get("entity_name") or node.get("name") or node.get("label") or "").strip()
+            node_type = str(node.get("node_type") or node.get("entity_type") or node.get("type") or node.get("category") or "").strip()
+            if not node_id:
+                node_id = f"n{idx + 1}"
+            normalized_nodes.append({
+                "node_id": node_id,
+                "node_name": node_name,
+                "node_type": node_type,
+                "source_id": source_id,
+                "source_filename": source_filename,
+            })
+
+        normalized_edges: List[Dict[str, str]] = []
+        for idx, edge in enumerate(raw_edges):
+            if not isinstance(edge, dict):
+                logger.warning(f"Skipping non-dict edge at index {idx} for source_id={source_id}.")
+                continue
+            source_entity = str(edge.get("source_entity") or edge.get("source") or edge.get("from") or "").strip()
+            target_entity = str(edge.get("target_entity") or edge.get("target") or edge.get("to") or "").strip()
+            relationship_type = str(edge.get("relationship_type") or edge.get("relation") or edge.get("predicate") or "").strip()
+            edge_source_id = str(edge.get("source_id") or edge.get("sourceId") or edge.get("sourceID") or source_id).strip() or source_id
+            if not source_entity or not target_entity:
+                logger.warning(f"Skipping edge missing source/target at index {idx} for source_id={source_id}.")
+                continue
+            normalized_edges.append({
+                "source_entity": source_entity,
+                "target_entity": target_entity,
+                "relationship_type": relationship_type,
+                "source_id": edge_source_id,
+                "source_filename": source_filename,
+            })
+
+        return {"nodes": normalized_nodes, "edges": normalized_edges}
+
+    def extract_entities_and_relationships(self, text_content: str, source_id: str, source_filename: str = "", max_text_length: int = config.LLM_ENTITY_MAX_INPUT_LENGTH) -> Dict[str, List[Dict]]:
         logger.info(f"Request to extract entities/relationships for source_id: '{source_id}' (original len {len(text_content)}, processing max {max_text_length}).")
         truncated_text = text_content[:max_text_length]
         if len(text_content) > max_text_length:
@@ -914,13 +951,9 @@ Return ONLY valid JSON with keys "nodes" and "edges"."""
             logger.warning(f"Invalid entity JSON for '{source_id}'. Returning empty payload.")
             return {"nodes": [], "edges": []}
 
-        logger.info(f"Entity extraction success for '{source_id}'. Found {len(parsed_json['nodes'])} nodes, {len(parsed_json['edges'])} edges.")
-        for item_list in parsed_json.values():
-            if isinstance(item_list, list):
-                for item in item_list:
-                    if isinstance(item, dict) and item.get("source_id") != source_id:
-                        item["source_id"] = source_id
-        return parsed_json
+        normalized = self.normalize_graph_payload(parsed_json, source_id=source_id, source_filename=source_filename)
+        logger.info(f"Entity extraction success for '{source_id}'. Found {len(normalized['nodes'])} nodes, {len(normalized['edges'])} edges.")
+        return normalized
 
     def classify_document(self, text_snippet: str) -> str:
         if not text_snippet.strip():
