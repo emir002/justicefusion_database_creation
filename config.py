@@ -162,26 +162,6 @@ OLLAMA_TIMEOUT = 120  # seconds
 GEMINI_API_KEYS = [
     "AIzaSyACwD6jqblNqJIbnzQQqiQcOGWY4pkYTqI",  # Example Key 1
     "AIzaSyD2nV3ZIcc6Uzh0gTVUAnJQ2UqS2VWygUA",  # Example Key 2
-    "AIzaSyCGRfy0UtxUbyq-8jANBSSA-rLVY9aBe9c",  # ... add all your keys
-    "AIzaSyAvJ6ndoDeefvi7qxDkd22SEM6JQhvRjuU",
-    "AIzaSyDhx3Nt8earop6VYALs9_rrWxy7uiamT_g",
-    "AIzaSyDlXLHenrb9zvyxZO-o7jBa5aI57mQC38Q",
-    "AIzaSyA5gx7Xj9Qc_8H5YsYiZuIia3uabq6iGzw",
-    "AIzaSyDy-_sjfVh9HatbtZAZEf_H1QZD_UMDAlU",
-    "AIzaSyDqiHjez2Q8t4bezGTiRN5yjyPB7Hcsnfo",
-    "AIzaSyDCjJePo4DZHhbYShxHzdMddcWtndLXeJ0",
-    "AIzaSyDv1ErlCMWMSyPiqXV4hcVQFasWp9RuyVI",
-    "AIzaSyA3ZUTGxyTJ8v4amtvBh0iuMWhPrUYpHiY",
-    "AIzaSyB72eLqCYRLRm-_L5vhSa3igFdGpkFhOB4",
-    "AIzaSyAVR0z0vzGsfBsRk6feyFyvH9VKeKTh_8s",
-    "AIzaSyB58GiV5mUEuFXYjLgEM93IM34BSMn474g",
-    "AIzaSyB41BEgSfY0Mb3qe3XVJpVC9IYSbId-q7M",
-    "AIzaSyCEKTt4kN2cvNJJMu0GheTwT8-Iw1SclD0",
-    "AIzaSyBZVtLDftl1dFh7C-jzdlzEBO67b1ilV6I",
-    "AIzaSyCSIIVFhooEsPriogiAzfLbhketiFaTGyA",
-    "AIzaSyCUzw6nUbCOjh4P2Mj6vgyrwq_vn5OFkw8",
-    "AIzaSyCZ4NdWwaKVZ9YIOdyImGcjryy83fgklq0",
-    "AIzaSyDNWJDET1Yw5NFQ8JEu6oTjlHpN4qNPj5o"
 ]
 GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key and key.strip()]  # Filter out empty/whitespace-only keys
 logger.info(f"LLM Model: {GEMINI_MODEL_NAME}, Number of API keys: {len(GEMINI_API_KEYS)}")
