@@ -775,6 +775,19 @@ class LLMManager:
         return cleaned.strip("` \n")
 
     @staticmethod
+    def _is_effectively_empty(text: Optional[str]) -> bool:
+        if text is None:
+            return True
+        return str(text).strip().lower() in {"", "null", "none", "n/a", "na"}
+
+    @staticmethod
+    def _strip_markdown_wrappers(text: str) -> str:
+        cleaned = (text or "").strip()
+        cleaned = re.sub(r"^```(?:[a-zA-Z0-9_-]+)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned.strip("` \n")
+
+    @staticmethod
     def _normalize_simple_answer(text: str) -> str:
         if not text:
             return ""
