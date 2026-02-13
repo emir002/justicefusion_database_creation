@@ -401,7 +401,8 @@ class LLMManager:
                                      temperature: float = 0.5,
                                      max_output_tokens: Optional[int] = None,
                                      validator=None,
-                                     json_mode: bool = False) -> Optional[str]:
+                                     json_mode: bool = False,
+                                     system_prompt: Optional[str] = None) -> Optional[str]:
 
             # -----------------------------------------------------------------
             # LOCAL-ONLY MODE: always use Ollama
@@ -410,13 +411,24 @@ class LLMManager:
                 local_temp = temperature if temperature is not None else getattr(config, "LOCAL_LLM_TEMPERATURE", 0.5)
                 max_retries = getattr(config, "LLM_MAX_RETRIES", getattr(config, "LLM_MAX_RETRIES_PER_ITEM", 3))
                 backoff_base = getattr(config, "LLM_BACKOFF_BASE_SECONDS", 0.8)
+                model_name = getattr(config, "LOCAL_LLM_MODEL_NAME", getattr(config, "LIGHTRAG_MODEL_NAME", "")).lower()
+                reasoning_prefixes = [p.lower() for p in getattr(config, "REASONING_MODEL_PREFIXES", ["gpt-oss"]) if p]
+                is_reasoning_model = any(model_name.startswith(prefix) for prefix in reasoning_prefixes)
+                min_reasoning_tokens = int(getattr(config, "MIN_LOCAL_MAX_OUTPUT_TOKENS_FOR_REASONING", 256))
+
+                requested_tokens = max_output_tokens or getattr(config, "LOCAL_LLM_MAX_OUTPUT_TOKENS", 512)
+                if is_reasoning_model:
+                    requested_tokens = max(requested_tokens, min_reasoning_tokens)
+
                 last_reason = "unknown"
                 for attempt in range(1, max_retries + 1):
+                    attempt_tokens = requested_tokens + ((attempt - 1) * max(64, requested_tokens // 4))
                     result = self._call_ollama(
                         prompt,
                         local_temp,
-                        max_output_tokens,
+                        attempt_tokens,
                         response_format="json" if json_mode else None,
+                        system_prompt=system_prompt,
                     )
                     if result is not None:
                         stripped = self._strip_markdown_wrappers(result)
@@ -651,73 +663,116 @@ class LLMManager:
     def _call_ollama(self, prompt: str,
                      temperature: float = config.LIGHTRAG_TEMPERATURE,
                      max_output_tokens: int | None = None,
-                     response_format: Optional[str] = None) -> str | None:
+                     response_format: Optional[str] = None,
+                     system_prompt: Optional[str] = None,
+                     use_chat: Optional[bool] = None) -> str | None:
         """
-        Fire a single request to the local Ollama HTTP endpoint. Returns `str`
-        or None if something goes wrong.
+        Fire a single request to the local Ollama endpoint. Supports both /api/generate and /api/chat.
         """
         local_model = getattr(config, "LOCAL_LLM_MODEL_NAME", getattr(config, "LIGHTRAG_MODEL_NAME", ""))
-        ollama_url = getattr(config, "LIGHTRAG_OLLAMA_URL", None)
+        generate_url = getattr(config, "LIGHTRAG_OLLAMA_URL", None)
         if hasattr(config, "OLLAMA_BASE_URL") and hasattr(config, "OLLAMA_GENERATE_ENDPOINT"):
-            ollama_url = f"{config.OLLAMA_BASE_URL}{config.OLLAMA_GENERATE_ENDPOINT}"
-
-        options = {"temperature": temperature}
-        if max_output_tokens:
-            options["num_predict"] = max_output_tokens
-
-        payload: Dict[str, Any] = {
-            "model": local_model,
-            "prompt": prompt,
-            "stream": False,
-            "options": options,
+            generate_url = f"{config.OLLAMA_BASE_URL}{config.OLLAMA_GENERATE_ENDPOINT}"
+        chat_url = getattr(config, "OLLAMA_CHAT_ENDPOINT", f"{getattr(config, 'OLLAMA_BASE_URL', 'http://localhost:11434')}/api/chat")
+    
+        options: Dict[str, Any] = {
+            "temperature": temperature,
+            "top_p": 0.9,
+            "top_k": 40,
+            "repeat_penalty": 1.05,
         }
-        if response_format:
-            payload["format"] = response_format
-
+        if max_output_tokens:
+            options["num_predict"] = int(max_output_tokens)
+    
+        auto_use_chat = bool(getattr(config, "OLLAMA_USE_CHAT", True))
+        endpoint_type = "chat" if (auto_use_chat if use_chat is None else use_chat) else "generate"
+        ollama_url = chat_url if endpoint_type == "chat" else generate_url
+    
+        if endpoint_type == "chat":
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            payload: Dict[str, Any] = {
+                "model": local_model,
+                "messages": messages,
+                "stream": False,
+                "options": options,
+            }
+        else:
+            final_prompt = prompt if not system_prompt else f"System:\n{system_prompt}\n\nUser:\n{prompt}"
+            payload = {
+                "model": local_model,
+                "prompt": final_prompt,
+                "stream": False,
+                "options": options,
+            }
+    
+        if response_format == "json":
+            payload["format"] = "json"
+    
         prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
+        self._last_ollama_failure_reason = "unknown"
         try:
-            r = requests.post(
-                ollama_url, json=payload,
-                timeout=getattr(config, "OLLAMA_TIMEOUT", 60)
-            )
+            r = requests.post(ollama_url, json=payload, timeout=getattr(config, "OLLAMA_TIMEOUT", 60))
             r.raise_for_status()
             data = r.json()
-
+    
             if isinstance(data, dict) and data.get("error"):
                 self._last_ollama_failure_reason = f"error field: {str(data.get('error'))[:120]}"
                 metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
                 return None
-
+    
             response_text = ""
             if isinstance(data, dict):
-                response_text = data.get("response", "") or ""
+                response_text = str(data.get("response", "") or "")
                 if self._is_effectively_empty(response_text):
-                    message = data.get("message")
-                    if isinstance(message, dict):
-                        response_text = message.get("content", "") or ""
-
-            response_text = textwrap.dedent(response_text).strip()
+                    msg = data.get("message")
+                    if isinstance(msg, dict):
+                        response_text = str(msg.get("content", "") or "")
+                if self._is_effectively_empty(response_text):
+                    choices = data.get("choices")
+                    if isinstance(choices, list) and choices:
+                        first = choices[0] if isinstance(choices[0], dict) else {}
+                        message = first.get("message") if isinstance(first, dict) else None
+                        if isinstance(message, dict):
+                            response_text = str(message.get("content", "") or "")
+    
+            response_text = self._strip_markdown_wrappers(textwrap.dedent(response_text).strip())
             if self._is_effectively_empty(response_text):
                 keys = list(data.keys()) if isinstance(data, dict) else []
                 self._last_ollama_failure_reason = "empty response"
                 logger.debug(
-                    "Empty Ollama response model=%s endpoint=%s keys=%s prompt_len=%s prompt_sha1=%s",
+                    "Empty Ollama response model=%s endpoint_type=%s keys=%s prompt_len=%s prompt_sha1=%s",
                     local_model,
-                    ollama_url,
+                    endpoint_type,
                     keys,
                     len(prompt),
                     prompt_hash,
                 )
                 metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
                 return None
-
+    
             metrics.LLM_CALLS.labels(endpoint="ollama", status="success").inc()
-            return self._strip_markdown_wrappers(response_text)
+            return response_text
         except Exception as e:
             self._last_ollama_failure_reason = f"{type(e).__name__}: {e}"
             logger.error(f"Ollama request failed: {type(e).__name__}: {e}")
             metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
             return None
+    
+    @staticmethod
+    def _is_effectively_empty(text: Optional[str]) -> bool:
+        if text is None:
+            return True
+        return str(text).strip().lower() in {"", "null", "none", "n/a", "na"}
+
+    @staticmethod
+    def _strip_markdown_wrappers(text: str) -> str:
+        cleaned = (text or "").strip()
+        cleaned = re.sub(r"^```(?:[a-zA-Z0-9_-]+)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned.strip("` \n")
 
     @staticmethod
     def _is_effectively_empty(text: Optional[str]) -> bool:
@@ -774,7 +829,13 @@ class LLMManager:
             stem = Path(original_filename or "Untitled Document").stem
             stem = re.sub(r"[_\-]+", " ", stem)
             stem = re.sub(r"\s+", " ", stem).strip()
-            return _clean_title(stem) or "Untitled Document"
+            first_line = ""
+            for line in text.splitlines():
+                if line.strip():
+                    first_line = line.strip()
+                    break
+            fallback = " - ".join([part for part in [stem, first_line] if part]).strip()
+            return _clean_title(fallback) or _clean_title(stem) or "Untitled Document"
 
         if not snippet:
             logger.warning("Cannot extract title from empty text snippet. Using filename fallback.")
@@ -827,6 +888,13 @@ Return ONLY valid JSON with keys "nodes" and "edges"."""
 
         json_mode = self.llm_mode == "local" and getattr(config, "OLLAMA_JSON_MODE_FOR_ENTITY_EXTRACTION", True)
         response_text = self._generate_content_with_retry(prompt, temperature=0.3, max_output_tokens=2048, json_mode=json_mode)
+        if self._is_effectively_empty(response_text) or (response_text and response_text.startswith("Error:")):
+            response_text = self._generate_content_with_retry(
+                prompt + "\nReturn only JSON.",
+                temperature=0.2,
+                max_output_tokens=3072,
+                json_mode=True,
+            )
 
         def _parse_candidate(raw_text: str) -> Optional[Dict[str, List[Dict]]]:
             candidate_text = self._strip_markdown_wrappers(raw_text)
@@ -859,9 +927,12 @@ Return ONLY valid JSON with keys "nodes" and "edges"."""
             logger.warning("Empty snippet for classification – defaulting to OTHER.")
             return "OTHER"
 
-        def _valid_label(value: str) -> bool:
-            token = re.sub(r"[^A-Z]", "", self._normalize_simple_answer(value))
-            return token in {"LAW", "MIXED", "OTHER"}
+        def _extract_label(value: str) -> str:
+            if not value:
+                return ""
+            upper = self._normalize_simple_answer(value)
+            match = re.search(r"\b(LAW|MIXED|OTHER)\b", upper)
+            return match.group(1) if match else ""
 
         prompt = f"""Analyze the following text snippet and classify it into one of three categories: LAW, MIXED, or OTHER.
 
@@ -876,19 +947,20 @@ Return ONLY valid JSON with keys "nodes" and "edges"."""
 
 **OUTPUT:**
 Return only a single word: LAW, MIXED, or OTHER."""
-        reply = self._generate_content_with_retry(prompt, temperature=0.1, max_output_tokens=16, validator=_valid_label)
+        reply = self._generate_content_with_retry(prompt, temperature=0.0, max_output_tokens=64, validator=lambda x: bool(_extract_label(x)))
+        label = _extract_label(reply or "") if reply and not reply.startswith("Error:") else ""
 
-        if not (reply and not reply.startswith("Error:") and _valid_label(reply)):
+        if not label:
             hardened_prompt = (
                 "Respond with ONLY one token: LAW or MIXED or OTHER. No punctuation. No explanation.\n\n"
                 f"TEXT:\n{text_snippet}"
             )
-            reply = self._generate_content_with_retry(hardened_prompt, temperature=0.0, max_output_tokens=16, validator=_valid_label)
+            reply = self._generate_content_with_retry(hardened_prompt, temperature=0.0, max_output_tokens=64, validator=lambda x: bool(_extract_label(x)))
+            label = _extract_label(reply or "") if reply and not reply.startswith("Error:") else ""
 
-        if reply and not reply.startswith("Error:") and _valid_label(reply):
-            ans = re.sub(r"[^A-Z]", "", self._normalize_simple_answer(reply))
-            logger.info(f"Document snippet classified as '{ans}'.")
-            return ans
+        if label:
+            logger.info(f"Document snippet classified as '{label}'.")
+            return label
 
         logger.error(f"Classifier LLM failed after retry: {reply}. Defaulting to OTHER.")
         return "OTHER"
