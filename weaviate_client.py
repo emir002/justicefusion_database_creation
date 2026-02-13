@@ -2,6 +2,7 @@
 # weaviate_client.py
 
 import logging
+import os
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 import time
@@ -164,6 +165,89 @@ class WeaviateManager:
         else:
             logger.info(f"Collection '{collection_name}' does not exist. No deletion needed.")
 
+    @staticmethod
+    def _canonical_graph_schema() -> Dict[str, Dict[str, DataType]]:
+        return {
+            config.WEAVIATE_NODE_CLASS: {
+                "node_id": DataType.TEXT,
+                "node_name": DataType.TEXT,
+                "node_type": DataType.TEXT,
+                "source_id": DataType.TEXT,
+                "source_filename": DataType.TEXT,
+            },
+            config.WEAVIATE_EDGE_CLASS: {
+                "source_entity": DataType.TEXT,
+                "target_entity": DataType.TEXT,
+                "relationship_type": DataType.TEXT,
+                "source_id": DataType.TEXT,
+                "source_filename": DataType.TEXT,
+            },
+        }
+
+    def _extract_collection_properties(self, collection_name: str) -> Dict[str, str]:
+        """Best-effort extraction of collection property names/types from Weaviate config object."""
+        if not self.client:
+            return {}
+        try:
+            collection = self.client.collections.get(collection_name)
+            config_obj = collection.config.get()
+            props = getattr(config_obj, "properties", None)
+            if props is None and hasattr(config_obj, "to_dict"):
+                props = config_obj.to_dict().get("properties", [])
+
+            out: Dict[str, str] = {}
+            if isinstance(props, list):
+                for p in props:
+                    if isinstance(p, dict):
+                        name = str(p.get("name", ""))
+                        dtype = p.get("dataType") or p.get("data_type") or p.get("dataType", [])
+                        if isinstance(dtype, list) and dtype:
+                            dtype = dtype[0]
+                        out[name] = str(dtype).lower()
+                    else:
+                        name = getattr(p, "name", "")
+                        dtype = getattr(p, "data_type", "")
+                        dtype_str = ""
+                        if isinstance(dtype, list) and dtype:
+                            dtype_str = str(dtype[0])
+                        else:
+                            dtype_str = str(dtype)
+                        out[str(name)] = dtype_str.lower()
+            return out
+        except Exception as e:
+            logger.error(f"Failed reading schema for '{collection_name}': {e}", exc_info=True)
+            return {}
+
+    def _graph_schema_is_compatible(self) -> bool:
+        expected = self._canonical_graph_schema()
+        node_props = self._extract_collection_properties(config.WEAVIATE_NODE_CLASS)
+        edge_props = self._extract_collection_properties(config.WEAVIATE_EDGE_CLASS)
+        if not node_props or not edge_props:
+            return False
+
+        if "node_id" not in node_props:
+            return False
+
+        legacy_uuid_fields = {"source", "target"}
+        if any(f in edge_props and "uuid" in edge_props[f] for f in legacy_uuid_fields):
+            return False
+
+        for coll_name, coll_expected in expected.items():
+            actual = node_props if coll_name == config.WEAVIATE_NODE_CLASS else edge_props
+            for prop in coll_expected.keys():
+                if prop not in actual:
+                    return False
+        return True
+
+    def _filter_properties_for_collection(self, collection_name: str, props: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(props, dict):
+            return {}
+        schema = self._canonical_graph_schema()
+        allowed = set(schema.get(collection_name, {}).keys())
+        if not allowed:
+            return props
+        return {k: v for k, v in props.items() if k in allowed}
+
     def _ensure_schema(self):
         if not self.is_connected():
             logger.error("Cannot ensure schema: Not connected.")
@@ -197,11 +281,10 @@ class WeaviateManager:
             },
             config.WEAVIATE_NODE_CLASS: {
                 "properties": [
-                    Property(name="entity_name", data_type=DataType.TEXT, tokenization=prop_tokenization),
-                    Property(name="entity_type", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
-                    Property(name="description", data_type=DataType.TEXT, tokenization=prop_tokenization),
+                    Property(name="node_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="node_name", data_type=DataType.TEXT, tokenization=prop_tokenization),
+                    Property(name="node_type", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="source_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
-                    # NEW: tie node rows to file for reliable cleanup
                     Property(name="source_filename", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                 ], "description": "Stores knowledge graph nodes (legal entities)."
             },
@@ -216,6 +299,24 @@ class WeaviateManager:
                 ], "description": "Stores knowledge graph edges (relationships)."
             },
         }
+
+        if self.run_mode == "UPDATE":
+            node_exists = self._collection_exists(config.WEAVIATE_NODE_CLASS)
+            edge_exists = self._collection_exists(config.WEAVIATE_EDGE_CLASS)
+            if node_exists and edge_exists and not self._graph_schema_is_compatible():
+                recreate_graph = os.getenv("WEAVIATE_RECREATE_GRAPH_SCHEMA", "0").strip().lower() in {"1", "true", "yes"}
+                if recreate_graph:
+                    logger.warning("Graph schema mismatch detected in UPDATE mode. Recreating GraphNodes/GraphEdges due to WEAVIATE_RECREATE_GRAPH_SCHEMA=1.")
+                    self._delete_collection(config.WEAVIATE_NODE_CLASS)
+                    self._delete_collection(config.WEAVIATE_EDGE_CLASS)
+                else:
+                    msg = (
+                        "Graph schema mismatch detected for GraphNodes/GraphEdges in UPDATE mode. "
+                        "Set WEAVIATE_RECREATE_GRAPH_SCHEMA=1 to recreate only graph collections, "
+                        "or run FIRST_RUN mode."
+                    )
+                    logger.error(msg)
+                    raise RuntimeError(msg)
 
         for name, spec in collections_to_ensure.items():
             if self.run_mode == "FIRST_RUN":
@@ -324,8 +425,9 @@ class WeaviateManager:
                 for i in range(len(data_properties_list)):
                     try:
                         current_vector = vectors_list[i]
+                        filtered_props = self._filter_properties_for_collection(collection_name, data_properties_list[i])
                         batch_context.add_object(
-                            properties=data_properties_list[i],
+                            properties=filtered_props,
                             vector=current_vector,
                             uuid=uuids_list[i]
                         )

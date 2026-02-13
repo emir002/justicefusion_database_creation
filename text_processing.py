@@ -15,7 +15,7 @@ import re
 import nltk
 
 try:
-    from langdetect import detect, LangDetectException
+    from langdetect import detect, LangDetectException, DetectorFactory
 except ImportError:
     logging.getLogger(__name__).warning(
         "langdetect library not found. Please install it (`pip install langdetect`). "
@@ -23,6 +23,7 @@ except ImportError:
     )
     detect = None
     LangDetectException = Exception # Define for try-except block to function
+    DetectorFactory = None
 
 # Local imports
 import config
@@ -30,6 +31,9 @@ import utils # Uses the modified utils.py
 import metrics
 
 logger = logging.getLogger(__name__)
+
+if DetectorFactory is not None:
+    DetectorFactory.seed = 0  # deterministic langdetect behavior
 
 # This dictionary will hold initialized Stanza pipelines {lang_code: pipeline_object}
 stanza_pipelines: Dict[str, stanza.Pipeline] = {}

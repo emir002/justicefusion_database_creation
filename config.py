@@ -148,6 +148,12 @@ LOCAL_LLM_MODEL_NAME = "gpt-oss:20b"
 # Ollama endpoint (OpenAI-style model server is NOT used here; this is Ollama's HTTP API).
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_GENERATE_ENDPOINT = "/api/generate"
+# Prefer chat endpoint for instruct/chat models (e.g., gpt-oss) in local mode.
+OLLAMA_CHAT_ENDPOINT = f"{OLLAMA_BASE_URL}/api/chat"
+OLLAMA_USE_CHAT = os.getenv("OLLAMA_USE_CHAT", "1").strip() not in {"0", "false", "False"}
+# Reasoning models can return empty output if token budget is too small.
+MIN_LOCAL_MAX_OUTPUT_TOKENS_FOR_REASONING = int(os.getenv("MIN_LOCAL_MAX_OUTPUT_TOKENS_FOR_REASONING", "256"))
+REASONING_MODEL_PREFIXES = [p.strip() for p in os.getenv("REASONING_MODEL_PREFIXES", "gpt-oss").split(",") if p.strip()]
 
 # Local generation defaults
 LOCAL_LLM_TEMPERATURE = 0.5
@@ -174,6 +180,9 @@ LLM_RETRY_WAIT_INITIAL = 2  # seconds
 LLM_RETRY_WAIT_MULTIPLIER = 2
 LLM_RETRY_WAIT_MAX = 60     # seconds
 LLM_MAX_RETRIES_PER_ITEM = 3  # Added from discussion, max retries for a specific LLM task on an item (e.g. summary for one chunk)
+LLM_MAX_RETRIES = LLM_MAX_RETRIES_PER_ITEM
+LLM_BACKOFF_BASE_SECONDS = 0.8
+OLLAMA_JSON_MODE_FOR_ENTITY_EXTRACTION = True
 logger.info(
     f"LLM Rate Limits: {LLM_RATE_LIMIT_PER_MINUTE}/min per key, {LLM_DAILY_LIMIT_PER_KEY}/day per key. "
     f"Call Retries: {LLM_RETRY_ATTEMPTS} attempts. Max item retries: {LLM_MAX_RETRIES_PER_ITEM}"

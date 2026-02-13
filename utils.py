@@ -140,48 +140,108 @@ def generate_graph_edge_id(source_entity_name: str,
     return generate_uuid_from_string(canonical_identifier)
 
 # --- JSON Handling ---
-def safe_json_loads(json_str: str, source_info: str = "Unknown source") -> Optional[Union[Dict[str, Any], List[Any]]]:
-    """Safely loads a JSON string, with an attempt to repair it if initial parsing fails."""
-    if not json_str or not json_str.strip():
-        logger.warning(f"Received empty or whitespace-only JSON string from {source_info}. Cannot parse.")
+def extract_json_block(text: str) -> Optional[str]:
+    """Extract first balanced JSON object/array from text (after removing code fences)."""
+    if not isinstance(text, str):
         return None
 
-    cleaned_json_str = json_str.strip()
-    # Remove common markdown code block fences, including language specifier case-insensitively
-    if cleaned_json_str.startswith("```"):
-        temp_str = cleaned_json_str[3:] # Remove initial ```
-        # Check if 'json' (case-insensitive) follows immediately or after some whitespace
-        if temp_str.lstrip().lower().startswith("json"):
-            # If 'json' is found, advance past it
-            # Find the actual end of "json" (case-insensitive) to slice correctly
-            idx_after_lang_spec = temp_str.lower().find("json") + len("json")
-            cleaned_json_str = temp_str[idx_after_lang_spec:].lstrip() # Remove 'json' and any leading whitespace/newline
-        else:
-            # If not 'json', it's a generic ```, so just remove ``` and leading whitespace
-            cleaned_json_str = temp_str.lstrip()
-        
-        # Remove trailing ``` if it exists
-        if cleaned_json_str.endswith("```"):
-            cleaned_json_str = cleaned_json_str[:-3].rstrip()
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
 
+    start_idx = None
+    start_char = ""
+    for idx, char in enumerate(cleaned):
+        if char in "[{":
+            start_idx = idx
+            start_char = char
+            break
+
+    if start_idx is None:
+        return None
+
+    end_char = "}" if start_char == "{" else "]"
+    depth = 0
+    in_string = False
+    escape = False
+
+    for idx in range(start_idx, len(cleaned)):
+        char = cleaned[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == start_char:
+            depth += 1
+        elif char == end_char:
+            depth -= 1
+            if depth == 0:
+                return cleaned[start_idx:idx + 1]
+
+    return None
+
+
+def safe_json_loads(json_str: str, source_info: str = "Unknown source") -> Union[Dict[str, Any], List[Any]]:
+    """Safely loads a JSON string with layered fallbacks for wrapped/malformed model output."""
+    if not json_str or not json_str.strip():
+        logger.warning(f"Received empty or whitespace-only JSON string from {source_info}. Cannot parse.")
+        return {}
+
+    cleaned_json_str = json_str.strip()
+    # Remove markdown fences early
+    if cleaned_json_str.startswith("```"):
+        cleaned_json_str = re.sub(r"^```(?:json)?\s*", "", cleaned_json_str, flags=re.IGNORECASE)
+        cleaned_json_str = re.sub(r"\s*```$", "", cleaned_json_str).strip()
 
     try:
         return json.loads(cleaned_json_str)
     except json.JSONDecodeError as e:
+        extracted_json_str = extract_json_block(cleaned_json_str)
+        if extracted_json_str:
+            try:
+                return json.loads(extracted_json_str)
+            except json.JSONDecodeError:
+                pass
+
+        # object substring fallback
+        obj_start, obj_end = cleaned_json_str.find("{"), cleaned_json_str.rfind("}")
+        if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+            try:
+                return json.loads(cleaned_json_str[obj_start:obj_end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        # array substring fallback
+        arr_start, arr_end = cleaned_json_str.find("["), cleaned_json_str.rfind("]")
+        if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+            try:
+                return json.loads(cleaned_json_str[arr_start:arr_end + 1])
+            except json.JSONDecodeError:
+                pass
+
         logger.warning(f"Standard JSON parsing failed for {source_info}: {e}. Attempting to repair with json_repair.")
         try:
-            repaired_json_str = repair_json(cleaned_json_str)
-            # Ensure the repaired string is actually valid JSON before returning
-            # by parsing it again. repair_json can sometimes return non-string or invalid structures.
+            repair_target = extracted_json_str or cleaned_json_str
+            repaired_json_str = repair_json(repair_target)
             if isinstance(repaired_json_str, str):
-                return json.loads(repaired_json_str)
-            else: # Should not happen if repair_json works as expected (returns string)
-                logger.error(f"JSON repair for {source_info} did not return a string. Type: {type(repaired_json_str)}. Data: {str(repaired_json_str)[:100]}")
-                return None # Or handle as appropriate
+                parsed = json.loads(repaired_json_str)
+                logger.info(f"JSON parsing for {source_info} succeeded after json_repair.")
+                return parsed
+            logger.error(f"JSON repair for {source_info} did not return a string. Type: {type(repaired_json_str)}")
+            return {}
         except Exception as repair_e:
             logger.error(f"JSON repair also failed for {source_info}. Original decode error: {e}, Repair error: {repair_e}", exc_info=True)
-            logger.debug(f"Original problematic JSON string from {source_info} (first 500 chars):\n{json_str.strip()[:500]}") # Log original non-cleaned
-            return None
+            logger.debug(f"Original problematic JSON string from {source_info} (first 500 chars):\n{json_str.strip()[:500]}")
+            return {}
 
 # --- File Hashing ---
 def get_file_hash(file_path: Path, algorithm: str = 'md5') -> Optional[str]:
