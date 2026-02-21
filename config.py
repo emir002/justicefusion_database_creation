@@ -177,7 +177,7 @@ REASONING_MODEL_PREFIXES = [p.strip() for p in os.getenv("REASONING_MODEL_PREFIX
 # Local generation defaults
 LOCAL_LLM_TEMPERATURE = 0.5
 LOCAL_LLM_MAX_OUTPUT_TOKENS = 8192
-OLLAMA_TIMEOUT = 120  # seconds
+OLLAMA_TIMEOUT = 240  # seconds
 
 
 # -----------------------------------------------------------------------------
