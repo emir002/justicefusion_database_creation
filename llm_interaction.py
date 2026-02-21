@@ -872,12 +872,27 @@ Title:"""
             node_id = str(node.get("node_id") or node.get("id") or node.get("nodeId") or "").strip()
             node_name = str(node.get("node_name") or node.get("entity_name") or node.get("name") or node.get("label") or "").strip()
             node_type = str(node.get("node_type") or node.get("entity_type") or node.get("type") or node.get("category") or "").strip()
+            description = str(
+                node.get("description")
+                or node.get("node_description")
+                or node.get("desc")
+                or node.get("summary")
+                or node.get("definition")
+                or node.get("details")
+                or ""
+            ).strip()
             if not node_id:
                 node_id = f"n{idx + 1}"
+            if not description:
+                if node_name:
+                    description = f"{node_name} ({node_type})" if node_type else node_name
+                else:
+                    description = "Entity"
             normalized_nodes.append({
                 "node_id": node_id,
                 "node_name": node_name,
                 "node_type": node_type,
+                "description": description,
                 "source_id": source_id,
                 "source_filename": source_filename,
             })
@@ -921,7 +936,29 @@ Text Snippet:
 {truncated_text}
 ---
 
-Return ONLY valid JSON with keys "nodes" and "edges"."""
+Return ONLY valid JSON with keys "nodes" and "edges".
+
+Each node object MUST contain: "node_id", "node_name", "node_type", "description".
+"description" must be a short legal meaning/context sentence or short phrase.
+
+Expected JSON shape:
+{{
+  "nodes": [
+    {{
+      "node_id": "n1",
+      "node_name": "...",
+      "node_type": "...",
+      "description": "..."
+    }}
+  ],
+  "edges": [
+    {{
+      "source_entity": "...",
+      "target_entity": "...",
+      "relationship_type": "..."
+    }}
+  ]
+}}"""
 
         json_mode = self.llm_mode == "local" and getattr(config, "OLLAMA_JSON_MODE_FOR_ENTITY_EXTRACTION", True)
         response_text = self._generate_content_with_retry(prompt, temperature=0.3, max_output_tokens=2048, json_mode=json_mode)

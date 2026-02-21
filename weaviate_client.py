@@ -174,6 +174,7 @@ class WeaviateManager:
                 "node_type": DataType.TEXT,
                 "source_id": DataType.TEXT,
                 "source_filename": DataType.TEXT,
+                "description": DataType.TEXT,
             },
             config.WEAVIATE_EDGE_CLASS: {
                 "source_entity": DataType.TEXT,
@@ -286,6 +287,7 @@ class WeaviateManager:
                     Property(name="node_type", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="source_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="source_filename", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="description", data_type=DataType.TEXT, tokenization=prop_tokenization),
                 ], "description": "Stores knowledge graph nodes (legal entities)."
             },
             config.WEAVIATE_EDGE_CLASS: {
@@ -328,6 +330,9 @@ class WeaviateManager:
                     self._create_collection(name, spec["properties"], spec["description"])
                 else:
                     logger.info(f"Collection '{name}' exists. Skipping creation in UPDATE mode.")
+        if os.getenv("DEBUG_SCHEMA", "0").strip().lower() in {"1", "true", "yes"}:
+            node_schema = self._extract_collection_properties(config.WEAVIATE_NODE_CLASS)
+            logger.info(f"DEBUG_SCHEMA=1 | GraphNodes properties: {sorted(node_schema.keys())}")
         logger.info("Schema setup/verification process completed.")
 
     def delete_objects_by_filter(self, collection_name: str, weaviate_filter: Filter) -> int:

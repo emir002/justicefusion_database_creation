@@ -245,9 +245,14 @@ class DocumentIndexer:
                         "node_id": str(n.get("node_id", "")).strip() or f"n{idx + 1}",
                         "node_name": str(n.get("node_name", "")).strip(),
                         "node_type": str(n.get("node_type", "")).strip(),
+                        "description": str(n.get("description", "")).strip(),
                         "source_id": str(n.get("source_id", entity_source_id)).strip() or entity_source_id,
                         "source_filename": filename,
                     }
+                    if not node_props["description"]:
+                        base = node_props.get("node_name") or node_props.get("node_type") or node_props.get("node_id") or "Entity"
+                        t = node_props.get("node_type", "").strip()
+                        node_props["description"] = f"{base} ({t})".strip() if t else base
                     all_nodes.append({
                         "properties": node_props,
                         "uuid": utils.generate_graph_node_id(
@@ -300,10 +305,26 @@ class DocumentIndexer:
                 [o["uuid"] for o in all_data_objects]
             )
         if all_nodes:
+            node_texts = [
+                f"{n['properties'].get('node_name', '')}\n{n['properties'].get('node_type', '')}\n{n['properties'].get('description', '')}".strip()
+                for n in all_nodes
+            ]
+            node_vectors = self.embedding_manager.get_embeddings(
+                node_texts,
+                prompt_name=config.EMBEDDING_PROMPT_DOCUMENT
+            )
+            if not node_vectors or len(node_vectors) != len(all_nodes):
+                logger.error(
+                    f"Node embedding batch mismatch for '{filename}': vectors={len(node_vectors) if node_vectors else 0}, nodes={len(all_nodes)}. Falling back to per-node embeddings."
+                )
+                node_vectors = []
+                for text in node_texts:
+                    single = self.embedding_manager.get_embeddings([text], prompt_name=config.EMBEDDING_PROMPT_DOCUMENT)
+                    node_vectors.append(single[0] if single and len(single) > 0 else None)
             self.weaviate_manager.upsert_data_objects(
                 config.WEAVIATE_NODE_CLASS,
                 [n["properties"] for n in all_nodes],
-                [None] * len(all_nodes),
+                node_vectors,
                 [n["uuid"] for n in all_nodes]
             )
         if all_edges:
@@ -394,9 +415,14 @@ class DocumentIndexer:
                         "node_id": str(n.get("node_id", "")).strip() or f"n{idx + 1}",
                         "node_name": str(n.get("node_name", "")).strip(),
                         "node_type": str(n.get("node_type", "")).strip(),
+                        "description": str(n.get("description", "")).strip(),
                         "source_id": str(n.get("source_id", entity_source_id)).strip() or entity_source_id,
                         "source_filename": filename,
                     }
+                    if not node_props["description"]:
+                        base = node_props.get("node_name") or node_props.get("node_type") or node_props.get("node_id") or "Entity"
+                        t = node_props.get("node_type", "").strip()
+                        node_props["description"] = f"{base} ({t})".strip() if t else base
                     all_nodes.append({
                         "properties": node_props,
                         "uuid": utils.generate_graph_node_id(
@@ -449,10 +475,26 @@ class DocumentIndexer:
                 [o["uuid"] for o in all_data_objects]
             )
         if all_nodes:
+            node_texts = [
+                f"{n['properties'].get('node_name', '')}\n{n['properties'].get('node_type', '')}\n{n['properties'].get('description', '')}".strip()
+                for n in all_nodes
+            ]
+            node_vectors = self.embedding_manager.get_embeddings(
+                node_texts,
+                prompt_name=config.EMBEDDING_PROMPT_DOCUMENT
+            )
+            if not node_vectors or len(node_vectors) != len(all_nodes):
+                logger.error(
+                    f"Node embedding batch mismatch for '{filename}': vectors={len(node_vectors) if node_vectors else 0}, nodes={len(all_nodes)}. Falling back to per-node embeddings."
+                )
+                node_vectors = []
+                for text in node_texts:
+                    single = self.embedding_manager.get_embeddings([text], prompt_name=config.EMBEDDING_PROMPT_DOCUMENT)
+                    node_vectors.append(single[0] if single and len(single) > 0 else None)
             self.weaviate_manager.upsert_data_objects(
                 config.WEAVIATE_NODE_CLASS,
                 [n["properties"] for n in all_nodes],
-                [None] * len(all_nodes),
+                node_vectors,
                 [n["uuid"] for n in all_nodes]
             )
         if all_edges:
