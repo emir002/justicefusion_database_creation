@@ -732,6 +732,13 @@ class LLMManager:
                         message = first.get("message") if isinstance(first, dict) else None
                         if isinstance(message, dict):
                             response_text = str(message.get("content", "") or "")
+                # Salvage: some Ollama models/endpoints may populate "thinking" while leaving response empty
+                if self._is_effectively_empty(response_text):
+                    thinking = data.get("thinking") if isinstance(data, dict) else None
+                    if isinstance(thinking, str) and thinking.strip():
+                        # Prefer extracting a JSON block if present to avoid returning long reasoning text
+                        candidate = thinking.strip()
+                        response_text = utils.extract_json_block(candidate) or candidate
             return self._strip_markdown_wrappers(textwrap.dedent(response_text).strip())
 
         def _attempt(endpoint_type: str, include_json_format: bool) -> tuple[Optional[str], Optional[dict], Optional[Exception]]:
@@ -817,11 +824,16 @@ class LLMManager:
         snippet = (text or "").strip()[:max_input_chars]
         if not snippet:
             return []
+        max_props = int(getattr(config, "PROP_MAX_PROPS_PER_CALL", 60))
+        max_chars_each = int(getattr(config, "PROP_MAX_CHARS_EACH", 220))
 
         prompt = f"""
 Split the following legal/administrative text into atomic propositions.
 Each proposition must be a single claim/statement (one subject-verb-meaning).
 Do NOT merge unrelated ideas. Keep references (Article numbers, dates, parties) inside the proposition.
+
+- Return AT MOST {max_props} propositions.
+- Each proposition MUST be <= {max_chars_each} characters.
 
 Return ONLY valid JSON: {{ "propositions": ["...", "..."] }}
 
@@ -829,7 +841,7 @@ TEXT:
 \"\"\"{snippet}\"\"\"
 """.strip()
 
-        json_mode = self.llm_mode == "local"
+        json_mode = (self.llm_mode == "local") and bool(getattr(config, "OLLAMA_JSON_MODE_FOR_PROPOSITIONS", False))
         start_time = time.time()
         status = 'failed'
         try:
@@ -999,6 +1011,10 @@ Title:"""
         if not truncated_text.strip():
             logger.warning(f"Cannot extract entities from empty text (source: '{source_id}').")
             return {"nodes": [], "edges": []}
+        max_nodes = int(getattr(config, "GRAPH_MAX_NODES_PER_CHUNK", 20))
+        max_edges = int(getattr(config, "GRAPH_MAX_EDGES_PER_CHUNK", 30))
+        desc_words = int(getattr(config, "GRAPH_DESC_MAX_WORDS", 12))
+
         prompt = f"""Task: Analyze the following legal text snippet. Extract key legal entities (nodes) and their relationships (edges).
 
 Source ID (for all extracted items): "{source_id}"
@@ -1009,6 +1025,8 @@ Text Snippet:
 ---
 
 Return ONLY valid JSON with keys "nodes" and "edges".
+Return AT MOST {max_nodes} nodes and AT MOST {max_edges} edges.
+Each node "description" MUST be <= {desc_words} words.
 
 Each node object MUST contain: "node_id", "node_name", "node_type", "description".
 "description" must be a short legal meaning/context sentence or short phrase.
