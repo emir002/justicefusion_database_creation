@@ -103,7 +103,21 @@ PROP_MAX_PROPOSITIONS_PER_CHUNK = int(os.getenv("PROP_MAX_PROPOSITIONS_PER_CHUNK
 
 # LLM proposition extraction limits
 PROP_LLM_MAX_INPUT_CHARS = int(os.getenv("PROP_LLM_MAX_INPUT_CHARS", "6000"))
-PROP_LLM_MAX_OUTPUT_TOKENS = int(os.getenv("PROP_LLM_MAX_OUTPUT_TOKENS", "2048"))
+PROP_LLM_MAX_OUTPUT_TOKENS = int(os.getenv("PROP_LLM_MAX_OUTPUT_TOKENS", "6144"))
+
+# Safer defaults for gpt-oss:* and other reasoning-heavy models
+OLLAMA_JSON_MODE_FOR_PROPOSITIONS = os.getenv(
+    "OLLAMA_JSON_MODE_FOR_PROPOSITIONS", "0"
+).strip().lower() in {"1", "true", "yes"}
+
+# Bound proposition extraction output (prevents token-limit cutoffs)
+PROP_MAX_PROPS_PER_CALL = int(os.getenv("PROP_MAX_PROPS_PER_CALL", "60"))
+PROP_MAX_CHARS_EACH = int(os.getenv("PROP_MAX_CHARS_EACH", "220"))
+
+# Bound graph extraction output (prevents giant JSON payloads)
+GRAPH_MAX_NODES_PER_CHUNK = int(os.getenv("GRAPH_MAX_NODES_PER_CHUNK", "20"))
+GRAPH_MAX_EDGES_PER_CHUNK = int(os.getenv("GRAPH_MAX_EDGES_PER_CHUNK", "30"))
+GRAPH_DESC_MAX_WORDS = int(os.getenv("GRAPH_DESC_MAX_WORDS", "12"))
 
 # If true, try LLM proposition extraction; if false, use heuristic splitting only
 ENABLE_LLM_PROPOSITION_EXTRACTION = os.getenv("ENABLE_LLM_PROPOSITION_EXTRACTION", "1").strip() not in {"0","false","False"}
