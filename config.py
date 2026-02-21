@@ -107,7 +107,7 @@ PROP_LLM_MAX_OUTPUT_TOKENS = int(os.getenv("PROP_LLM_MAX_OUTPUT_TOKENS", "6144")
 
 # Safer defaults for gpt-oss:* and other reasoning-heavy models
 OLLAMA_JSON_MODE_FOR_PROPOSITIONS = os.getenv(
-    "OLLAMA_JSON_MODE_FOR_PROPOSITIONS", "0"
+    "OLLAMA_JSON_MODE_FOR_PROPOSITIONS", "1"
 ).strip().lower() in {"1", "true", "yes"}
 
 # Bound proposition extraction output (prevents token-limit cutoffs)
