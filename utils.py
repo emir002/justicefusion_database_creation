@@ -101,6 +101,39 @@ def generate_doc_chunk_id(filename: str, chunk_index: int) -> str:
     identifier = f"document_chunk::filename:{filename}::chunk_index:{chunk_index}"
     return generate_uuid_from_string(identifier)
 
+
+def make_source_id_from_filename(filename: str) -> str:
+    h = hashlib.sha1(filename.encode("utf-8")).hexdigest()[:6].upper()
+    return f"S-{h}"
+
+
+def make_chunk_id(source_id: str,
+                  chunk_index: int,
+                  page_start: Optional[int] = None,
+                  page_end: Optional[int] = None,
+                  prop_start: Optional[int] = None,
+                  prop_end: Optional[int] = None) -> str:
+    base = f"{source_id}#{chunk_index}"
+    if page_start is not None and page_end is not None:
+        base += f"@p{page_start}-{page_end}"
+    if prop_start is not None and prop_end is not None:
+        base += f"@pr{prop_start}-{prop_end}"
+    return base
+
+
+def generate_doc_chunk_id_v2(filename: str,
+                             chunk_index: int,
+                             page_start: Optional[int] = None,
+                             page_end: Optional[int] = None,
+                             prop_start: Optional[int] = None,
+                             prop_end: Optional[int] = None) -> str:
+    identifier = f"document_chunk::filename:{filename}::chunk_index:{chunk_index}"
+    if page_start is not None and page_end is not None:
+        identifier += f"::pages:{page_start}-{page_end}"
+    if prop_start is not None and prop_end is not None:
+        identifier += f"::props:{prop_start}-{prop_end}"
+    return generate_uuid_from_string(identifier)
+
 def generate_legal_article_id(law_title: str, article_number: str, source_filename: str) -> str:
     """Generates a deterministic UUID string for a specific legal article."""
     norm_title = law_title.strip().lower()

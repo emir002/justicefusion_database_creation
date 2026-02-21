@@ -192,6 +192,7 @@ class DocumentIndexer:
 
         all_data_objects, all_nodes, all_edges = [], [], []
         skipped_articles_count = 0
+        source_id = utils.make_source_id_from_filename(filename)
 
         for i, (marker, body) in enumerate(articles_data):
             article_proc_start_time = time.time()
@@ -229,7 +230,12 @@ class DocumentIndexer:
                     "article_text": refined_text,
                     "doc_summary": law_document_summary,
                     "source_filename": filename,
-                    "keywords": []
+                    "keywords": [],
+                    "source_id": source_id,
+                    "chunk_id": f"{source_id}#{marker.replace(' ', '')}",
+                    "page_start": None,
+                    "page_end": None,
+                    "chunk_strategy": "article",
                 },
                 "vector": article_embedding,
                 "uuid": article_uuid
@@ -355,18 +361,25 @@ class DocumentIndexer:
         if not document_summary or document_summary.startswith("Error:"):
             document_summary = ""
 
-        text_chunks = TextProcessor.split_into_chunks(full_text_for_splitting_and_llm, config.CHUNK_MAX_CHARS, config.CHUNK_OVERLAP)
-        if not text_chunks:
+        chunk_dicts = TextProcessor.split_general_text(full_text_for_splitting_and_llm, llm_manager=self.llm_manager)
+        if not chunk_dicts:
             logger.warning(f"No chunks found in document '{filename}'. Skipping.")
             return
-        logger.info(f"Split '{filename}' into {len(text_chunks)} chunks.")
+        logger.info(f"Split '{filename}' into {len(chunk_dicts)} chunks using strategy='{config.CHUNKING_STRATEGY}'.")
 
         all_data_objects, all_nodes, all_edges = [], [], []
         skipped_chunks_count = 0
+        source_id = utils.make_source_id_from_filename(filename)
 
-        for i, chunk_text in enumerate(text_chunks):
+        for i, ch in enumerate(chunk_dicts):
+            chunk_text = ch["text"]
+            page_start = ch.get("page_start")
+            page_end = ch.get("page_end")
+            prop_start = ch.get("prop_start")
+            prop_end = ch.get("prop_end")
+            chunk_strategy = ch.get("chunk_strategy", config.CHUNKING_STRATEGY)
             chunk_proc_start_time = time.time()
-            logger.debug(f"Processing chunk {i+1}/{len(text_chunks)} from '{filename}'")
+            logger.debug(f"Processing chunk {i+1}/{len(chunk_dicts)} from '{filename}'")
             refined_text = TextProcessor.refine_and_lemmatize(chunk_text, f"other_chunk_{filename}_{i}")
             if not refined_text.strip():
                 logger.warning(f"Chunk {i} from '{filename}' empty after refinement. Skipping.")
@@ -388,7 +401,8 @@ class DocumentIndexer:
                 continue
             metrics.EMBEDDINGS_GENERATED.labels(status='success').inc()
 
-            chunk_uuid: str = utils.generate_doc_chunk_id(filename, i)
+            chunk_uuid: str = utils.generate_doc_chunk_id_v2(filename, i, page_start, page_end, prop_start, prop_end)
+            chunk_id = utils.make_chunk_id(source_id, i, page_start, page_end, prop_start, prop_end)
             entity_source_id: str = str(chunk_uuid)
             entities = self.llm_manager.extract_entities_and_relationships(refined_text, entity_source_id, source_filename=filename)
 
@@ -399,7 +413,14 @@ class DocumentIndexer:
                     "title": document_title,
                     "doc_summary": document_summary,
                     "chunk_index": i,
-                    "keywords": []
+                    "keywords": [],
+                    "source_id": source_id,
+                    "chunk_id": chunk_id,
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "prop_start": prop_start,
+                    "prop_end": prop_end,
+                    "chunk_strategy": chunk_strategy,
                 },
                 "vector": chunk_embedding,
                 "uuid": chunk_uuid
@@ -458,14 +479,14 @@ class DocumentIndexer:
 
             logger.debug(f"Finished chunk {i} in {time.time() - chunk_proc_start_time:.2f}s.")
 
-            _memnote(f"after chunk {i+1}/{len(text_chunks)} from {filename}")
+            _memnote(f"after chunk {i+1}/{len(chunk_dicts)} from {filename}")
 
             del refined_text, embeddings, chunk_embedding, entities
             if getattr(config, "AGGRESSIVE_MEMORY_CLEANUP", False):
-                self._flush_mem(f"after chunk {i+1}/{len(text_chunks)}")
+                self._flush_mem(f"after chunk {i+1}/{len(chunk_dicts)}")
 
-        if text_chunks:
-            logger.info(f"{skipped_chunks_count}/{len(text_chunks)} chunks skipped for '{filename}'.")
+        if chunk_dicts:
+            logger.info(f"{skipped_chunks_count}/{len(chunk_dicts)} chunks skipped for '{filename}'.")
 
         if all_data_objects:
             self.weaviate_manager.upsert_data_objects(
