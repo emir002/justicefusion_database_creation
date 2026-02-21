@@ -681,48 +681,43 @@ class LLMManager:
             "top_k": 40,
             "repeat_penalty": 1.05,
         }
+        num_ctx = int(getattr(config, "OLLAMA_NUM_CTX", 0) or 0)
+        if num_ctx > 0:
+            options["num_ctx"] = num_ctx
         if max_output_tokens:
             options["num_predict"] = int(max_output_tokens)
     
         auto_use_chat = bool(getattr(config, "OLLAMA_USE_CHAT", True))
-        endpoint_type = "chat" if (auto_use_chat if use_chat is None else use_chat) else "generate"
-        ollama_url = chat_url if endpoint_type == "chat" else generate_url
-    
-        if endpoint_type == "chat":
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-            payload: Dict[str, Any] = {
-                "model": local_model,
-                "messages": messages,
-                "stream": False,
-                "options": options,
-            }
-        else:
-            final_prompt = prompt if not system_prompt else f"System:\n{system_prompt}\n\nUser:\n{prompt}"
-            payload = {
-                "model": local_model,
-                "prompt": final_prompt,
-                "stream": False,
-                "options": options,
-            }
-    
-        if response_format == "json":
-            payload["format"] = "json"
-    
         prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
         self._last_ollama_failure_reason = "unknown"
-        try:
-            r = requests.post(ollama_url, json=payload, timeout=getattr(config, "OLLAMA_TIMEOUT", 60))
-            r.raise_for_status()
-            data = r.json()
-    
-            if isinstance(data, dict) and data.get("error"):
-                self._last_ollama_failure_reason = f"error field: {str(data.get('error'))[:120]}"
-                metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
-                return None
-    
+        primary_endpoint = "chat" if (auto_use_chat if use_chat is None else use_chat) else "generate"
+        alternate_endpoint = "generate" if primary_endpoint == "chat" else "chat"
+
+        def _build_payload(endpoint_type: str, include_json_format: bool) -> Dict[str, Any]:
+            if endpoint_type == "chat":
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                built_payload: Dict[str, Any] = {
+                    "model": local_model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": options,
+                }
+            else:
+                final_prompt = prompt if not system_prompt else f"System:\n{system_prompt}\n\nUser:\n{prompt}"
+                built_payload = {
+                    "model": local_model,
+                    "prompt": final_prompt,
+                    "stream": False,
+                    "options": options,
+                }
+            if include_json_format:
+                built_payload["format"] = "json"
+            return built_payload
+
+        def _extract_response_text(data: Any) -> str:
             response_text = ""
             if isinstance(data, dict):
                 response_text = str(data.get("response", "") or "")
@@ -737,29 +732,60 @@ class LLMManager:
                         message = first.get("message") if isinstance(first, dict) else None
                         if isinstance(message, dict):
                             response_text = str(message.get("content", "") or "")
-    
-            response_text = self._strip_markdown_wrappers(textwrap.dedent(response_text).strip())
+            return self._strip_markdown_wrappers(textwrap.dedent(response_text).strip())
+
+        def _attempt(endpoint_type: str, include_json_format: bool) -> tuple[Optional[str], Optional[dict], Optional[Exception]]:
+            ollama_url = chat_url if endpoint_type == "chat" else generate_url
+            payload = _build_payload(endpoint_type, include_json_format)
+            try:
+                r = requests.post(ollama_url, json=payload, timeout=getattr(config, "OLLAMA_TIMEOUT", 60))
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                return None, None, e
+
+            if isinstance(data, dict) and data.get("error"):
+                self._last_ollama_failure_reason = f"error field: {str(data.get('error'))[:120]}"
+                return None, data, None
+
+            response_text = _extract_response_text(data)
             if self._is_effectively_empty(response_text):
                 keys = list(data.keys()) if isinstance(data, dict) else []
                 self._last_ollama_failure_reason = "empty response"
                 logger.debug(
-                    "Empty Ollama response model=%s endpoint_type=%s keys=%s prompt_len=%s prompt_sha1=%s",
+                    "Empty Ollama response model=%s endpoint_type=%s keys=%s prompt_len=%s prompt_sha1=%s response_format=%s done_reason=%s eval_count=%s prompt_eval_count=%s total_duration=%s load_duration=%s",
                     local_model,
                     endpoint_type,
                     keys,
                     len(prompt),
                     prompt_hash,
+                    "json" if include_json_format else None,
+                    data.get("done_reason") if isinstance(data, dict) else None,
+                    data.get("eval_count") if isinstance(data, dict) else None,
+                    data.get("prompt_eval_count") if isinstance(data, dict) else None,
+                    data.get("total_duration") if isinstance(data, dict) else None,
+                    data.get("load_duration") if isinstance(data, dict) else None,
                 )
-                metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
-                return None
-    
-            metrics.LLM_CALLS.labels(endpoint="ollama", status="success").inc()
-            return response_text
-        except Exception as e:
-            self._last_ollama_failure_reason = f"{type(e).__name__}: {e}"
-            logger.error(f"Ollama request failed: {type(e).__name__}: {e}")
-            metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
-            return None
+                return None, data, None
+
+            return response_text, data, None
+
+        endpoint_sequence = [primary_endpoint, alternate_endpoint]
+        for endpoint_type in endpoint_sequence:
+            formats_to_try = [True, False] if response_format == "json" else [False]
+            for include_json_format in formats_to_try:
+                response_text, _data, error = _attempt(endpoint_type, include_json_format)
+                if error is not None:
+                    self._last_ollama_failure_reason = f"{type(error).__name__}: {error}"
+                    logger.error(f"Ollama request failed: {type(error).__name__}: {error}")
+                    metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
+                    return None
+                if response_text is not None:
+                    metrics.LLM_CALLS.labels(endpoint="ollama", status="success").inc()
+                    return response_text
+
+        metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
+        return None
     
     @staticmethod
     def _is_effectively_empty(text: Optional[str]) -> bool:
