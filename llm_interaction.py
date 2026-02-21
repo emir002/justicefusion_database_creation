@@ -760,13 +760,15 @@ class LLMManager:
                 keys = list(data.keys()) if isinstance(data, dict) else []
                 self._last_ollama_failure_reason = "empty response"
                 logger.debug(
-                    "Empty Ollama response model=%s endpoint_type=%s keys=%s prompt_len=%s prompt_sha1=%s response_format=%s done_reason=%s eval_count=%s prompt_eval_count=%s total_duration=%s load_duration=%s",
+                    "Empty Ollama response model=%s endpoint_type=%s keys=%s prompt_len=%s prompt_sha1=%s response_format=%s num_predict=%s num_ctx=%s done_reason=%s eval_count=%s prompt_eval_count=%s total_duration=%s load_duration=%s",
                     local_model,
                     endpoint_type,
                     keys,
                     len(prompt),
                     prompt_hash,
                     "json" if include_json_format else None,
+                    options.get("num_predict"),
+                    options.get("num_ctx"),
                     data.get("done_reason") if isinstance(data, dict) else None,
                     data.get("eval_count") if isinstance(data, dict) else None,
                     data.get("prompt_eval_count") if isinstance(data, dict) else None,
@@ -777,7 +779,11 @@ class LLMManager:
 
             return response_text, data, None
 
-        endpoint_sequence = [primary_endpoint, alternate_endpoint]
+        if response_format == "json":
+            # /api/generate is generally more stable for strict JSON output.
+            endpoint_sequence = ["generate", "chat"]
+        else:
+            endpoint_sequence = [primary_endpoint, alternate_endpoint]
         for endpoint_type in endpoint_sequence:
             formats_to_try = [True, False] if response_format == "json" else [False]
             for include_json_format in formats_to_try:
@@ -788,6 +794,16 @@ class LLMManager:
                     metrics.LLM_CALLS.labels(endpoint="ollama", status="failure").inc()
                     return None
                 if response_text is not None:
+                    if isinstance(_data, dict):
+                        logger.debug(
+                            "Ollama response diagnostics model=%s endpoint_type=%s response_format=%s num_predict=%s num_ctx=%s done_reason=%s",
+                            local_model,
+                            endpoint_type,
+                            "json" if include_json_format else None,
+                            options.get("num_predict"),
+                            options.get("num_ctx"),
+                            _data.get("done_reason"),
+                        )
                     metrics.LLM_CALLS.labels(endpoint="ollama", status="success").inc()
                     return response_text
 
@@ -894,6 +910,19 @@ TEXT:
             cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:")
             if len(cleaned) > 140:
                 cleaned = cleaned[:140].rsplit(" ", 1)[0].strip()
+            lowered = cleaned.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "we need to",
+                    "based on the provided",
+                    "here is",
+                    "suggested title",
+                    "the title is",
+                    "i cannot",
+                )
+            ):
+                return ""
             return cleaned if len(cleaned) >= 5 else ""
 
         def _filename_fallback() -> str:
@@ -1051,13 +1080,33 @@ Expected JSON shape:
 }}"""
 
         json_mode = self.llm_mode == "local" and getattr(config, "OLLAMA_JSON_MODE_FOR_ENTITY_EXTRACTION", True)
-        response_text = self._generate_content_with_retry(prompt, temperature=0.3, max_output_tokens=2048, json_mode=json_mode)
+        entity_temp = float(getattr(config, "LLM_ENTITY_EXTRACTION_TEMPERATURE", 0.1))
+        entity_max_tokens = int(getattr(config, "LLM_ENTITY_EXTRACTION_MAX_OUTPUT_TOKENS", 3072))
+        entity_retry_tokens = int(getattr(config, "LLM_ENTITY_EXTRACTION_RETRY_MAX_OUTPUT_TOKENS", 4096))
+
+        def _looks_like_entity_graph_json(raw_text: str) -> bool:
+            if not raw_text:
+                return False
+            text = self._strip_markdown_wrappers(raw_text)
+            if "{" not in text or "}" not in text:
+                return False
+            lowered = text.lower()
+            return "\"nodes\"" in lowered and "\"edges\"" in lowered
+
+        response_text = self._generate_content_with_retry(
+            prompt,
+            temperature=entity_temp,
+            max_output_tokens=entity_max_tokens,
+            json_mode=json_mode,
+            validator=_looks_like_entity_graph_json,
+        )
         if self._is_effectively_empty(response_text) or (response_text and response_text.startswith("Error:")):
             response_text = self._generate_content_with_retry(
                 prompt + "\nReturn only JSON.",
-                temperature=0.2,
-                max_output_tokens=3072,
+                temperature=0.0,
+                max_output_tokens=entity_retry_tokens,
                 json_mode=True,
+                validator=_looks_like_entity_graph_json,
             )
 
         def _parse_candidate(raw_text: str) -> Optional[Dict[str, List[Dict]]]:
@@ -1071,7 +1120,13 @@ Expected JSON shape:
         parsed_json = _parse_candidate(response_text) if response_text and not response_text.startswith("Error:") else None
         if not parsed_json:
             strict_prompt = prompt + "\nRespond with JSON only. No prose."
-            retry_text = self._generate_content_with_retry(strict_prompt, temperature=0.2, max_output_tokens=2048, json_mode=json_mode)
+            retry_text = self._generate_content_with_retry(
+                strict_prompt,
+                temperature=0.0,
+                max_output_tokens=entity_retry_tokens,
+                json_mode=True,
+                validator=_looks_like_entity_graph_json,
+            )
             parsed_json = _parse_candidate(retry_text) if retry_text and not retry_text.startswith("Error:") else None
 
         if not parsed_json:

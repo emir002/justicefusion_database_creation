@@ -60,34 +60,37 @@ def _central_error_handler_internal(message: str, exception: Exception):
     else:
         logger.error(f"Unhandled Error - {message}: {exception}", exc_info=True)
 
-# --- Stanza Initialization (kept available but not used for embedder pipeline if LEMMATIZE_IN_EMBEDDER=False) ---
+# --- Stanza Initialization (only when lemmatization in embedder is explicitly enabled) ---
 _nlp_pipelines_internal: Dict[str, stanza.Pipeline] = {}
 _supported_stanza_languages_internal = getattr(config, 'STANZA_LANGUAGES', ['hr', 'sr'])
 _use_gpu_internal = torch.cuda.is_available()
 
-try:
-    logger.info(f"Initializing Stanza for EmbeddingModelManager. GPU available: {_use_gpu_internal}")
+if LEMMATIZE_IN_EMBEDDER:
     try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        logger.info("NLTK 'punkt' not found for EmbeddingModelManager, downloading...")
-        nltk.download('punkt', quiet=True)
+        logger.info(f"Initializing Stanza for EmbeddingModelManager. GPU available: {_use_gpu_internal}")
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            logger.info("NLTK 'punkt' not found for EmbeddingModelManager, downloading...")
+            nltk.download('punkt', quiet=True)
 
-    for lang_code in _supported_stanza_languages_internal:
-        logger.info(f"Downloading/loading Stanza model for: {lang_code} in EmbeddingModelManager")
-        stanza.download(lang_code, processors='tokenize,pos,lemma', verbose=False, logging_level='WARN')
-        _nlp_pipelines_internal[lang_code] = stanza.Pipeline(
-            lang_code,
-            processors='tokenize,pos,lemma',
-            use_gpu=_use_gpu_internal,
-            verbose=False,
-            logging_level='WARN'
-        )
-    logger.info("Stanza pipelines initialized successfully for EmbeddingModelManager.")
-except Exception as e_stanza_init:
-    _central_error_handler_internal("Error downloading or initializing Stanza models in EmbeddingModelManager", e_stanza_init)
-    logger.warning("Stanza lemmatization will be unavailable in EmbeddingModelManager.")
-    _nlp_pipelines_internal = {}
+        for lang_code in _supported_stanza_languages_internal:
+            logger.info(f"Downloading/loading Stanza model for: {lang_code} in EmbeddingModelManager")
+            stanza.download(lang_code, processors='tokenize,pos,lemma', verbose=False, logging_level='WARN')
+            _nlp_pipelines_internal[lang_code] = stanza.Pipeline(
+                lang_code,
+                processors='tokenize,pos,lemma',
+                use_gpu=_use_gpu_internal,
+                verbose=False,
+                logging_level='WARN'
+            )
+        logger.info("Stanza pipelines initialized successfully for EmbeddingModelManager.")
+    except Exception as e_stanza_init:
+        _central_error_handler_internal("Error downloading or initializing Stanza models in EmbeddingModelManager", e_stanza_init)
+        logger.warning("Stanza lemmatization will be unavailable in EmbeddingModelManager.")
+        _nlp_pipelines_internal = {}
+else:
+    logger.info("Skipping Stanza initialization in EmbeddingModelManager (LEMMATIZE_IN_EMBEDDER=False).")
 
 # --- Text Processing Functions ---
 _email_pattern_internal = re.compile(r'\S+@\S+\.\S+')

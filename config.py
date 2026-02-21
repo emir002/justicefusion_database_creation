@@ -221,7 +221,11 @@ logger.info(
 # Max input character lengths for different LLM tasks (adjust as needed)
 LLM_SUMMARY_MAX_INPUT_LENGTH = 7000  # Max characters from document to send for summary
 LLM_TITLE_SNIPPET_MAX_LEN = 2000     # Max characters from start of doc for title extraction
-LLM_ENTITY_MAX_INPUT_LENGTH = 8000   # Max characters from chunk/article for entity extraction
+LLM_ENTITY_MAX_INPUT_LENGTH = int(os.getenv("LLM_ENTITY_MAX_INPUT_LENGTH", "3000"))
+# Keep JSON tasks deterministic and give graph extraction enough output budget.
+LLM_ENTITY_EXTRACTION_TEMPERATURE = float(os.getenv("LLM_ENTITY_EXTRACTION_TEMPERATURE", "0.1"))
+LLM_ENTITY_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_ENTITY_EXTRACTION_MAX_OUTPUT_TOKENS", "3072"))
+LLM_ENTITY_EXTRACTION_RETRY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_ENTITY_EXTRACTION_RETRY_MAX_OUTPUT_TOKENS", "4096"))
 
 # -----------------------------------------------------------------------------
 # Local LLM (Ollama) – backwards-compatible names (used by llm_interaction.py)
@@ -285,7 +289,7 @@ LOGGING_CONFIG = {
     "formatters": {
         "standard": {
             "format": "%(asctime)s [%(levelname)s] %(name)s (%(module)s.%(funcName)s:%(lineno)d): %(message)s",
-            "datefmt": "2024-%m-%d %H:%M:%S",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
         },
     },
     "handlers": {
