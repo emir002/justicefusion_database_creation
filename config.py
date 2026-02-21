@@ -89,6 +89,25 @@ CHUNK_MAX_CHARS = 1500
 CHUNK_OVERLAP = 300
 STANZA_LANGUAGES = ['hr', 'sr']
 
+# -----------------------------------------------------------------------------
+# Chunking strategy
+# -----------------------------------------------------------------------------
+
+# "sentence" (current) or "proposition" (new)
+CHUNKING_STRATEGY = os.getenv("CHUNKING_STRATEGY", "proposition").strip().lower()
+
+# For proposition packing
+PROP_MAX_CHARS_PER_CHUNK = int(os.getenv("PROP_MAX_CHARS_PER_CHUNK", "1500"))
+PROP_OVERLAP_PROPOSITIONS = int(os.getenv("PROP_OVERLAP_PROPOSITIONS", "2"))  # overlap by N propositions
+PROP_MAX_PROPOSITIONS_PER_CHUNK = int(os.getenv("PROP_MAX_PROPOSITIONS_PER_CHUNK", "12"))
+
+# LLM proposition extraction limits
+PROP_LLM_MAX_INPUT_CHARS = int(os.getenv("PROP_LLM_MAX_INPUT_CHARS", "6000"))
+PROP_LLM_MAX_OUTPUT_TOKENS = int(os.getenv("PROP_LLM_MAX_OUTPUT_TOKENS", "2048"))
+
+# If true, try LLM proposition extraction; if false, use heuristic splitting only
+ENABLE_LLM_PROPOSITION_EXTRACTION = os.getenv("ENABLE_LLM_PROPOSITION_EXTRACTION", "1").strip() not in {"0","false","False"}
+
 # Max characters of text snippet for LLM document type classification
 LLM_CLASSIFICATION_SNIPPET_MAX_LEN = 3000
 
@@ -165,11 +184,7 @@ OLLAMA_TIMEOUT = 120  # seconds
 # External LLM (Gemini)
 # -----------------------------------------------------------------------------
 
-GEMINI_API_KEYS = [
-    "AIzaSyACwD6jqblNqJIbnzQQqiQcOGWY4pkYTqI",  # Example Key 1
-    "AIzaSyD2nV3ZIcc6Uzh0gTVUAnJQ2UqS2VWygUA",  # Example Key 2
-]
-GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key and key.strip()]  # Filter out empty/whitespace-only keys
+GEMINI_API_KEYS = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
 logger.info(f"LLM Model: {GEMINI_MODEL_NAME}, Number of API keys: {len(GEMINI_API_KEYS)}")
 
 LLM_RATE_LIMIT_PER_MINUTE = 15  # rate per key

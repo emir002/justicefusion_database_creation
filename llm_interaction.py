@@ -783,6 +783,52 @@ class LLMManager:
             normalized_text = normalized_text[len("ANSWER:"):].strip()
         return normalized_text.strip('"\':()').upper()
 
+    def extract_propositions(self, text: str, max_input_chars: int, max_output_tokens: int) -> List[str]:
+        """
+        Return list of atomic propositions from text.
+        Uses JSON-only output. Falls back to heuristic if JSON invalid.
+        """
+        snippet = (text or "").strip()[:max_input_chars]
+        if not snippet:
+            return []
+
+        prompt = f"""
+Split the following legal/administrative text into atomic propositions.
+Each proposition must be a single claim/statement (one subject-verb-meaning).
+Do NOT merge unrelated ideas. Keep references (Article numbers, dates, parties) inside the proposition.
+
+Return ONLY valid JSON: {{ "propositions": ["...", "..."] }}
+
+TEXT:
+\"\"\"{snippet}\"\"\"
+""".strip()
+
+        json_mode = self.llm_mode == "local"
+        start_time = time.time()
+        status = 'failed'
+        try:
+            resp = self._generate_content_with_retry(
+                prompt,
+                temperature=0.1,
+                max_output_tokens=max_output_tokens,
+                json_mode=json_mode,
+            )
+            if not resp or str(resp).startswith("Error:"):
+                return []
+
+            parsed = utils.safe_json_loads(resp, source_info="extract_propositions")
+            props = []
+            if isinstance(parsed, dict) and isinstance(parsed.get("propositions"), list):
+                for p in parsed["propositions"]:
+                    if isinstance(p, str) and p.strip():
+                        props.append(p.strip())
+            if props:
+                status = 'success'
+            return props
+        finally:
+            metrics.PROPOSITION_EXTRACTION_CALLS.labels(status=status).inc()
+            metrics.PROPOSITION_EXTRACTION_LATENCY.observe(time.time() - start_time)
+
     def generate_summary(self, text: str, max_length: int = config.LLM_SUMMARY_MAX_INPUT_LENGTH) -> str:
         logger.info(f"Request to generate summary (input original length {len(text)}, processing max_length {max_length}).")
         truncated_text = text[:max_length]

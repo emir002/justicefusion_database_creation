@@ -44,6 +44,17 @@ LLM_LATENCY = Histogram(
     buckets=[0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, float('inf')]
 )
 
+PROPOSITION_EXTRACTION_CALLS = Counter(
+    'proposition_extraction_calls_total',
+    'Total number of proposition extraction calls to LLM.',
+    ['status']
+)
+PROPOSITION_EXTRACTION_LATENCY = Histogram(
+    'proposition_extraction_latency_seconds',
+    'Latency of proposition extraction calls.',
+    buckets=[0.1, 0.25, 0.5, 1, 2, 3, 5, 10, 20, 30, 60, float('inf')]
+)
+
 # --- Embedding Model Metrics ---
 EMBED_CACHE_HITS = Counter(
     'embedding_dataset_cache_hits_total', 

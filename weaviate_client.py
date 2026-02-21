@@ -219,6 +219,29 @@ class WeaviateManager:
             logger.error(f"Failed reading schema for '{collection_name}': {e}", exc_info=True)
             return {}
 
+    def _ensure_collection_properties(self, collection_name: str, required_properties: List[Property]):
+        if not self.is_connected() or not self.client:
+            logger.error(f"Cannot ensure properties for '{collection_name}': Not connected.")
+            return
+
+        existing = self._extract_collection_properties(collection_name)
+        if not existing:
+            logger.warning(f"Could not read existing properties for '{collection_name}'. Skipping property sync.")
+            return
+
+        collection = self.client.collections.get(collection_name)
+        for prop in required_properties:
+            if prop.name in existing:
+                continue
+            try:
+                collection.config.add_property(prop)
+                logger.info(f"Added missing property '{prop.name}' to collection '{collection_name}'.")
+            except Exception as e:
+                logger.error(
+                    f"Failed to add missing property '{prop.name}' to collection '{collection_name}': {e}",
+                    exc_info=True,
+                )
+
     def _graph_schema_is_compatible(self) -> bool:
         expected = self._canonical_graph_schema()
         node_props = self._extract_collection_properties(config.WEAVIATE_NODE_CLASS)
@@ -268,6 +291,13 @@ class WeaviateManager:
                     Property(name="doc_summary", data_type=DataType.TEXT, tokenization=prop_tokenization),
                     Property(name="chunk_index", data_type=DataType.INT),
                     Property(name="keywords", data_type=DataType.TEXT_ARRAY, tokenization=prop_tokenization),
+                    Property(name="source_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="chunk_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="page_start", data_type=DataType.INT),
+                    Property(name="page_end", data_type=DataType.INT),
+                    Property(name="prop_start", data_type=DataType.INT),
+                    Property(name="prop_end", data_type=DataType.INT),
+                    Property(name="chunk_strategy", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                 ], "description": "Stores chunks of general documents."
             },
             config.WEAVIATE_ARTICLE_CLASS: {
@@ -278,6 +308,11 @@ class WeaviateManager:
                     Property(name="doc_summary", data_type=DataType.TEXT, tokenization=prop_tokenization),
                     Property(name="source_filename", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="keywords", data_type=DataType.TEXT_ARRAY, tokenization=prop_tokenization),
+                    Property(name="source_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="chunk_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="page_start", data_type=DataType.INT),
+                    Property(name="page_end", data_type=DataType.INT),
+                    Property(name="chunk_strategy", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                 ], "description": "Stores individual legal articles."
             },
             config.WEAVIATE_NODE_CLASS: {
@@ -329,7 +364,8 @@ class WeaviateManager:
                 if not self._collection_exists(name):
                     self._create_collection(name, spec["properties"], spec["description"])
                 else:
-                    logger.info(f"Collection '{name}' exists. Skipping creation in UPDATE mode.")
+                    logger.info(f"Collection '{name}' exists. Ensuring required properties in UPDATE mode.")
+                    self._ensure_collection_properties(name, spec["properties"])
         if os.getenv("DEBUG_SCHEMA", "0").strip().lower() in {"1", "true", "yes"}:
             node_schema = self._extract_collection_properties(config.WEAVIATE_NODE_CLASS)
             logger.info(f"DEBUG_SCHEMA=1 | GraphNodes properties: {sorted(node_schema.keys())}")

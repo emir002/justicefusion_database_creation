@@ -3,7 +3,7 @@
 
 import logging
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 import time
 
 # Third-party libraries
@@ -105,6 +105,31 @@ def initialize_stanza():
 
 initialize_stanza() # Call initialization when module is loaded
 
+_PAGE_MARKER_RE = re.compile(r"\[\[JF_PAGE:(\d+)\]\]")
+
+def iter_page_segments(text: str) -> List[Tuple[Optional[int], str]]:
+    """
+    Split text into segments tagged with page numbers, based on [[JF_PAGE:X]] markers.
+    Returns list of (page_num, segment_text). page_num can be None if no markers exist.
+    """
+    if not text:
+        return []
+
+    matches = list(_PAGE_MARKER_RE.finditer(text))
+    if not matches:
+        return [(None, text.strip())] if text.strip() else []
+
+    segments: List[Tuple[Optional[int], str]] = []
+    for i, m in enumerate(matches):
+        page_num = int(m.group(1))
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        seg = text[start:end].strip()
+        if seg:
+            segments.append((page_num, seg))
+    return segments
+
+
 
 class FileLoader:
     """Handles loading text content from various file formats."""
@@ -124,15 +149,20 @@ class FileLoader:
             if suffix == '.txt':
                 content = file_path.read_text(encoding='utf-8', errors='ignore')
             elif suffix == '.pdf':
-                # Using more granular PDF extraction similar to database3.py
                 text_content_parts = []
-                # laparams can be tuned if PDF extraction quality is an issue.
                 laparams = LAParams(line_margin=0.4, boxes_flow=0.5, char_margin=2.0, detect_vertical=False)
-                for page_layout in extract_pages(str(file_path), laparams=laparams):
+
+                for page_num, page_layout in enumerate(extract_pages(str(file_path), laparams=laparams), start=1):
+                    page_parts = []
                     for element in page_layout:
                         if isinstance(element, LTTextContainer):
-                            text_content_parts.append(element.get_text())
-                content = "".join(text_content_parts) if text_content_parts else ""
+                            page_parts.append(element.get_text())
+                    page_text = "".join(page_parts).strip()
+                    if page_text:
+                        # Marker used downstream for page_start/page_end
+                        text_content_parts.append(f"\n[[JF_PAGE:{page_num}]]\n{page_text}\n")
+
+                content = "\n".join(text_content_parts) if text_content_parts else ""
             elif suffix == '.docx':
                 doc = DocxDocument(str(file_path))
                 content = "\n".join([para.text for para in doc.paragraphs if para.text and para.text.strip()])
@@ -342,6 +372,133 @@ class TextProcessor:
         metrics.TEXT_PROCESSING_STAGES_LATENCY.labels(stage_name='chunking').observe(duration_chunk)
         logger.info(f"Text (length {len(text)}) split into {len(chunks)} chunks in {duration_chunk:.2f}s.")
         return chunks
+
+    @staticmethod
+    def split_into_propositions_heuristic(text: str) -> List[str]:
+        """
+        Simple heuristic: split by sentence, then additionally split by ';', ':' and ' i ' / ' te ' conjunction patterns,
+        without going crazy. This is a fallback only.
+        """
+        if not text or not text.strip():
+            return []
+
+        try:
+            sentences = nltk.sent_tokenize(text)
+        except Exception:
+            sentences = [s.strip() for s in re.split(r"[.\n]+", text) if s.strip()]
+
+        props: List[str] = []
+        for sent in sentences:
+            parts = re.split(r"\s*;\s*|\s*:\s*", sent)
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    continue
+                if len(part) > 220:
+                    sub = re.split(r"\s+\b(i|te|ali|odnosno)\b\s+", part, flags=re.IGNORECASE)
+                    tmp = [x.strip() for x in sub if x and x.strip() and x.lower() not in {"i", "te", "ali", "odnosno"}]
+                    props.extend(tmp if tmp else [part])
+                else:
+                    props.append(part)
+        return [p for p in (x.strip() for x in props) if p]
+
+    @staticmethod
+    def split_into_propositions(text: str, llm_manager=None) -> List[str]:
+        if not text or not text.strip():
+            return []
+        if getattr(config, "ENABLE_LLM_PROPOSITION_EXTRACTION", True) and llm_manager is not None:
+            try:
+                props = llm_manager.extract_propositions(
+                    text,
+                    max_input_chars=config.PROP_LLM_MAX_INPUT_CHARS,
+                    max_output_tokens=config.PROP_LLM_MAX_OUTPUT_TOKENS,
+                )
+                if props:
+                    return props
+            except Exception as e:
+                logger.warning(f"LLM proposition extraction failed, fallback to heuristic: {e}")
+        return TextProcessor.split_into_propositions_heuristic(text)
+
+    @staticmethod
+    def pack_propositions_into_chunks(propositions: List[str],
+                                      max_chars: int,
+                                      max_props: int,
+                                      overlap_props: int) -> List[Tuple[str, int, int]]:
+        """
+        Returns list of (chunk_text, prop_start_idx, prop_end_idx) indices inclusive.
+        """
+        chunks: List[Tuple[str, int, int]] = []
+        if not propositions:
+            return chunks
+
+        i = 0
+        while i < len(propositions):
+            curr = []
+            curr_len = 0
+            start = i
+
+            while i < len(propositions) and len(curr) < max_props:
+                p = propositions[i]
+                add_len = len(p) + (1 if curr else 0)
+                if curr and (curr_len + add_len) > max_chars:
+                    break
+                curr.append(p)
+                curr_len += add_len
+                i += 1
+
+            end = i - 1
+            chunk_text = " ".join(curr).strip()
+            if chunk_text:
+                chunks.append((chunk_text, start, end))
+
+            if overlap_props > 0:
+                i = max(start + 1, i - overlap_props)
+
+        return chunks
+
+    @staticmethod
+    def split_general_text(text: str, llm_manager=None) -> List[Dict[str, Any]]:
+        """
+        Returns a list of chunk dicts with page pointers + prop ranges.
+        Each dict: { "text": ..., "page_start":..., "page_end":..., "prop_start":..., "prop_end":... }
+        """
+        results: List[Dict[str, Any]] = []
+
+        segments = iter_page_segments(text)
+        for page_num, seg_text in segments:
+            if not seg_text.strip():
+                continue
+
+            if config.CHUNKING_STRATEGY == "proposition":
+                props = TextProcessor.split_into_propositions(seg_text, llm_manager=llm_manager)
+                packed = TextProcessor.pack_propositions_into_chunks(
+                    props,
+                    max_chars=config.PROP_MAX_CHARS_PER_CHUNK,
+                    max_props=config.PROP_MAX_PROPOSITIONS_PER_CHUNK,
+                    overlap_props=config.PROP_OVERLAP_PROPOSITIONS,
+                )
+                for chunk_text, ps, pe in packed:
+                    results.append({
+                        "text": chunk_text,
+                        "page_start": page_num,
+                        "page_end": page_num,
+                        "prop_start": ps,
+                        "prop_end": pe,
+                        "chunk_strategy": "proposition",
+                    })
+            else:
+                chunks = TextProcessor.split_into_chunks(seg_text, max_chars=config.CHUNK_MAX_CHARS, overlap=config.CHUNK_OVERLAP)
+                for c in chunks:
+                    results.append({
+                        "text": c,
+                        "page_start": page_num,
+                        "page_end": page_num,
+                        "prop_start": None,
+                        "prop_end": None,
+                        "chunk_strategy": "sentence",
+                    })
+
+        return results
 
     @staticmethod
     def split_law_articles(text: str) -> List[Tuple[str, str]]:
