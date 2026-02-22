@@ -158,13 +158,13 @@ def generate_graph_edge_id(source_entity_name: str,
     Creates a deterministic UUID string for a graph edge, scoped by source_id.
     This keeps edges stable for re-indexing while avoiding cross-document collisions.
     """
-    src = source_entity_name.strip().lower()
-    tgt = target_entity_name.strip().lower()
+    src = source_entity_name.strip()
+    tgt = target_entity_name.strip()
     rel = relationship_type.strip().lower().replace(" ", "_")
     src_id = source_id.strip()
 
-    canonical_identifier = f"graph_edge::source_id:{src_id}::from:{src}::to:{tgt}::rel:{rel}"
-    return generate_uuid_from_string(canonical_identifier)
+    identifier = f"graph_edge::source_id:{src_id}::from:{src}::to:{tgt}::rel:{rel}"
+    return generate_uuid_from_string(identifier)
 
 # --- JSON Handling ---
 def extract_json_block(text: str) -> Optional[str]:

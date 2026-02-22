@@ -270,24 +270,34 @@ class DocumentIndexer:
                 "uuid": article_uuid
             })
 
+            node_key_map: Dict[str, str] = {}
+            node_name_map: Dict[str, str] = {}
+
             # Add source_filename to nodes/edges for reliable cleanup
             if entities and isinstance(entities.get("nodes"), list):
                 for idx, n in enumerate(entities["nodes"]):
                     if not isinstance(n, dict):
                         logger.warning(f"Skipping non-dict node for '{filename}' article {i} at index {idx}.")
                         continue
+                    node_id = str(n.get("node_id", "")).strip() or f"n{idx + 1}"
+                    node_source_id = str(n.get("source_id", entity_source_id)).strip() or entity_source_id
+                    node_key = f"{node_source_id}::{node_id}"
+                    node_name = str(n.get("node_name", "")).strip() or node_id
                     node_props = {
-                        "node_id": str(n.get("node_id", "")).strip() or f"n{idx + 1}",
-                        "node_name": str(n.get("node_name", "")).strip(),
+                        "node_id": node_id,
+                        "node_key": node_key,
+                        "node_name": node_name,
                         "node_type": str(n.get("node_type", "")).strip(),
                         "description": str(n.get("description", "")).strip(),
-                        "source_id": str(n.get("source_id", entity_source_id)).strip() or entity_source_id,
+                        "source_id": node_source_id,
                         "source_filename": filename,
                     }
                     if not node_props["description"]:
                         base = node_props.get("node_name") or node_props.get("node_type") or node_props.get("node_id") or "Entity"
                         t = node_props.get("node_type", "").strip()
                         node_props["description"] = f"{base} ({t})".strip() if t else base
+                    node_key_map[node_id] = node_key
+                    node_name_map[node_id] = node_props["node_name"]
                     all_nodes.append({
                         "properties": node_props,
                         "uuid": utils.generate_graph_node_id(
@@ -306,23 +316,37 @@ class DocumentIndexer:
                     if not isinstance(e, dict):
                         logger.warning(f"Skipping non-dict edge for '{filename}' article {i} at index {idx}.")
                         continue
-                    edge_props = {
-                        "source_entity": str(e.get("source_entity", "")).strip(),
-                        "target_entity": str(e.get("target_entity", "")).strip(),
-                        "relationship_type": str(e.get("relationship_type", "")).strip(),
-                        "source_id": str(e.get("source_id", entity_source_id)).strip() or entity_source_id,
-                        "source_filename": filename,
-                    }
-                    if not edge_props["source_entity"] or not edge_props["target_entity"]:
+
+                    src_id = str(e.get("source_entity", "")).strip()
+                    tgt_id = str(e.get("target_entity", "")).strip()
+                    if not src_id or not tgt_id:
                         logger.warning(f"Skipping edge missing endpoints for '{filename}' article {i} at index {idx}.")
                         continue
+                    if src_id not in node_key_map or tgt_id not in node_key_map:
+                        logger.warning(f"Skipping edge with unresolved node ids for '{filename}' article {i} at index {idx}: {src_id}->{tgt_id}")
+                        continue
+
+                    edge_source_id = str(e.get("source_id", entity_source_id)).strip() or entity_source_id
+                    src_key = node_key_map[src_id]
+                    tgt_key = node_key_map[tgt_id]
+                    edge_props = {
+                        "source_node_id": src_id,
+                        "target_node_id": tgt_id,
+                        "source_node_key": src_key,
+                        "target_node_key": tgt_key,
+                        "source_entity": node_name_map.get(src_id, src_id),
+                        "target_entity": node_name_map.get(tgt_id, tgt_id),
+                        "relationship_type": str(e.get("relationship_type", "")).strip(),
+                        "source_id": edge_source_id,
+                        "source_filename": filename,
+                    }
                     all_edges.append({
                         "properties": edge_props,
                         "uuid": utils.generate_graph_edge_id(
-                            edge_props["source_entity"],
-                            edge_props["target_entity"],
+                            src_key,
+                            tgt_key,
                             edge_props["relationship_type"],
-                            edge_props["source_id"],
+                            edge_source_id,
                         ),
                     })
                     edges_inserted += 1
@@ -478,24 +502,34 @@ class DocumentIndexer:
                 "uuid": chunk_uuid
             })
 
+            node_key_map: Dict[str, str] = {}
+            node_name_map: Dict[str, str] = {}
+
             # Add source_filename to nodes/edges for reliable cleanup
             if entities and isinstance(entities.get("nodes"), list):
                 for idx, n in enumerate(entities["nodes"]):
                     if not isinstance(n, dict):
-                        logger.warning(f"Skipping non-dict node for '{filename}' article {i} at index {idx}.")
+                        logger.warning(f"Skipping non-dict node for '{filename}' chunk {i} at index {idx}.")
                         continue
+                    node_id = str(n.get("node_id", "")).strip() or f"n{idx + 1}"
+                    node_source_id = str(n.get("source_id", entity_source_id)).strip() or entity_source_id
+                    node_key = f"{node_source_id}::{node_id}"
+                    node_name = str(n.get("node_name", "")).strip() or node_id
                     node_props = {
-                        "node_id": str(n.get("node_id", "")).strip() or f"n{idx + 1}",
-                        "node_name": str(n.get("node_name", "")).strip(),
+                        "node_id": node_id,
+                        "node_key": node_key,
+                        "node_name": node_name,
                         "node_type": str(n.get("node_type", "")).strip(),
                         "description": str(n.get("description", "")).strip(),
-                        "source_id": str(n.get("source_id", entity_source_id)).strip() or entity_source_id,
+                        "source_id": node_source_id,
                         "source_filename": filename,
                     }
                     if not node_props["description"]:
                         base = node_props.get("node_name") or node_props.get("node_type") or node_props.get("node_id") or "Entity"
                         t = node_props.get("node_type", "").strip()
                         node_props["description"] = f"{base} ({t})".strip() if t else base
+                    node_key_map[node_id] = node_key
+                    node_name_map[node_id] = node_props["node_name"]
                     all_nodes.append({
                         "properties": node_props,
                         "uuid": utils.generate_graph_node_id(
@@ -514,23 +548,37 @@ class DocumentIndexer:
                     if not isinstance(e, dict):
                         logger.warning(f"Skipping non-dict edge for '{filename}' chunk {i} at index {idx}.")
                         continue
-                    edge_props = {
-                        "source_entity": str(e.get("source_entity", "")).strip(),
-                        "target_entity": str(e.get("target_entity", "")).strip(),
-                        "relationship_type": str(e.get("relationship_type", "")).strip(),
-                        "source_id": str(e.get("source_id", entity_source_id)).strip() or entity_source_id,
-                        "source_filename": filename,
-                    }
-                    if not edge_props["source_entity"] or not edge_props["target_entity"]:
+
+                    src_id = str(e.get("source_entity", "")).strip()
+                    tgt_id = str(e.get("target_entity", "")).strip()
+                    if not src_id or not tgt_id:
                         logger.warning(f"Skipping edge missing endpoints for '{filename}' chunk {i} at index {idx}.")
                         continue
+                    if src_id not in node_key_map or tgt_id not in node_key_map:
+                        logger.warning(f"Skipping edge with unresolved node ids for '{filename}' chunk {i} at index {idx}: {src_id}->{tgt_id}")
+                        continue
+
+                    edge_source_id = str(e.get("source_id", entity_source_id)).strip() or entity_source_id
+                    src_key = node_key_map[src_id]
+                    tgt_key = node_key_map[tgt_id]
+                    edge_props = {
+                        "source_node_id": src_id,
+                        "target_node_id": tgt_id,
+                        "source_node_key": src_key,
+                        "target_node_key": tgt_key,
+                        "source_entity": node_name_map.get(src_id, src_id),
+                        "target_entity": node_name_map.get(tgt_id, tgt_id),
+                        "relationship_type": str(e.get("relationship_type", "")).strip(),
+                        "source_id": edge_source_id,
+                        "source_filename": filename,
+                    }
                     all_edges.append({
                         "properties": edge_props,
                         "uuid": utils.generate_graph_edge_id(
-                            edge_props["source_entity"],
-                            edge_props["target_entity"],
+                            src_key,
+                            tgt_key,
                             edge_props["relationship_type"],
-                            edge_props["source_id"],
+                            edge_source_id,
                         ),
                     })
                     edges_inserted += 1

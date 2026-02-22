@@ -298,12 +298,16 @@ class LLMManager:
 
     def looks_like_pure_law(self, text_snippet: str, filename: str = "") -> bool:
         normalized_filename = (filename or "").lower()
-        filename_is_law_article = (
+        filename_has_law_marker = (
             ("zakon" in normalized_filename)
-            and ("član" in normalized_filename or "clan" in normalized_filename)
-            and bool(re.search(r"\b\d+\b", normalized_filename))
+            or ("sluzbeni glasnik" in normalized_filename)
+            or ("službeni glasnik" in normalized_filename)
         )
-        if not filename_is_law_article:
+        filename_has_commentary_marker = any(
+            marker in normalized_filename
+            for marker in ("komentar", "pojasnjenje", "pojašnjenje", "analiza", "prirucnik", "priručnik")
+        )
+        if not filename_has_law_marker or filename_has_commentary_marker:
             return False
 
         snippet = text_snippet or ""
@@ -1081,6 +1085,50 @@ Title:"""
                 "source_filename": source_filename,
             })
 
+        id_set = {node["node_id"] for node in normalized_nodes if node.get("node_id")}
+        name_to_id = {
+            node["node_name"].strip().lower(): node["node_id"]
+            for node in normalized_nodes
+            if node.get("node_name") and node.get("node_id")
+        }
+
+        def _next_implicit_node_id() -> str:
+            max_numeric_suffix = 0
+            for existing_node_id in id_set:
+                match = re.match(r"^n(\d+)$", existing_node_id)
+                if match:
+                    max_numeric_suffix = max(max_numeric_suffix, int(match.group(1)))
+            candidate = max_numeric_suffix + 1
+            while f"n{candidate}" in id_set:
+                candidate += 1
+            return f"n{candidate}"
+
+        def _resolve_edge_endpoint(raw_endpoint: str) -> str:
+            endpoint = raw_endpoint.strip()
+            if endpoint in id_set:
+                return endpoint
+
+            endpoint_lower = endpoint.lower()
+            if endpoint_lower in name_to_id:
+                return name_to_id[endpoint_lower]
+
+            implicit_node_id = _next_implicit_node_id()
+            implicit_name = endpoint or f"Implicit Entity {implicit_node_id}"
+            normalized_nodes.append({
+                "node_id": implicit_node_id,
+                "node_name": implicit_name,
+                "node_type": "Entity",
+                "description": f"{implicit_name} (Implicit)",
+                "source_id": source_id,
+                "source_filename": source_filename,
+            })
+            id_set.add(implicit_node_id)
+            name_to_id[implicit_name.strip().lower()] = implicit_node_id
+            logger.warning(
+                f"Created implicit node '{implicit_node_id}' for dangling edge endpoint '{raw_endpoint}' in source_id={source_id}."
+            )
+            return implicit_node_id
+
         normalized_edges: List[Dict[str, str]] = []
         for idx, edge in enumerate(raw_edges):
             if not isinstance(edge, dict):
@@ -1093,6 +1141,10 @@ Title:"""
             if not source_entity or not target_entity:
                 logger.warning(f"Skipping edge missing source/target at index {idx} for source_id={source_id}.")
                 continue
+
+            source_entity = _resolve_edge_endpoint(source_entity)
+            target_entity = _resolve_edge_endpoint(target_entity)
+
             normalized_edges.append({
                 "source_entity": source_entity,
                 "target_entity": target_entity,
@@ -1152,6 +1204,9 @@ Each node "description" MUST be <= {desc_words} words.
 
 Each node object MUST contain: "node_id", "node_name", "node_type", "description".
 "description" must be a short legal meaning/context sentence or short phrase.
+Edges MUST use node_id values for "source_entity" and "target_entity" (example: "n1").
+Every edge endpoint MUST reference an existing "node_id" from the "nodes" list.
+Do NOT invent edge endpoints that are not listed in "nodes".
 
 Expected JSON shape:
 {{
@@ -1234,7 +1289,7 @@ Expected JSON shape:
             )
             strict_graph_prompt = (
                 prompt
-                + "\nImportant: edge endpoints must reference existing nodes consistently via node_id (preferred) or exact node_name."
+                + "\nImportant: edge endpoints must use existing node_id values from the nodes list."
                 + "\nIf relationships exist in the text, return at least 2 edges."
                 + "\nRespond with JSON only."
             )

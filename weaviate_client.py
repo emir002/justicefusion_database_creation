@@ -179,6 +179,7 @@ class WeaviateManager:
         return {
             config.WEAVIATE_NODE_CLASS: {
                 "node_id": DataType.TEXT,
+                "node_key": DataType.TEXT,
                 "node_name": DataType.TEXT,
                 "node_type": DataType.TEXT,
                 "source_id": DataType.TEXT,
@@ -188,6 +189,10 @@ class WeaviateManager:
             config.WEAVIATE_EDGE_CLASS: {
                 "source_entity": DataType.TEXT,
                 "target_entity": DataType.TEXT,
+                "source_node_id": DataType.TEXT,
+                "target_node_id": DataType.TEXT,
+                "source_node_key": DataType.TEXT,
+                "target_node_key": DataType.TEXT,
                 "relationship_type": DataType.TEXT,
                 "source_id": DataType.TEXT,
                 "source_filename": DataType.TEXT,
@@ -327,6 +332,7 @@ class WeaviateManager:
             config.WEAVIATE_NODE_CLASS: {
                 "properties": [
                     Property(name="node_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="node_key", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="node_name", data_type=DataType.TEXT, tokenization=prop_tokenization),
                     Property(name="node_type", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="source_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
@@ -338,6 +344,10 @@ class WeaviateManager:
                 "properties": [
                     Property(name="source_entity", data_type=DataType.TEXT, tokenization=prop_tokenization),
                     Property(name="target_entity", data_type=DataType.TEXT, tokenization=prop_tokenization),
+                    Property(name="source_node_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="target_node_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="source_node_key", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="target_node_key", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="relationship_type", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     Property(name="source_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
                     # NEW: tie edge rows to file for reliable cleanup
