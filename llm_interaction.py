@@ -1042,6 +1042,7 @@ Title:"""
             return {"nodes": [], "edges": []}
 
         normalized_nodes: List[Dict[str, str]] = []
+        dropped_nodes = 0
         for idx, node in enumerate(raw_nodes):
             if not isinstance(node, dict):
                 logger.warning(f"Skipping non-dict node at index {idx} for source_id={source_id}.")
@@ -1060,11 +1061,17 @@ Title:"""
             ).strip()
             if not node_id:
                 node_id = f"n{idx + 1}"
+            if not node_name and not node_type:
+                dropped_nodes += 1
+                logger.warning(f"Dropping low-quality node at index {idx} for source_id={source_id}: empty node_name and node_type.")
+                continue
             if not description:
                 if node_name:
                     description = f"{node_name} ({node_type})" if node_type else node_name
                 else:
                     description = "Entity"
+            if not node_type:
+                node_type = "Unknown"
             normalized_nodes.append({
                 "node_id": node_id,
                 "node_name": node_name,
@@ -1094,7 +1101,29 @@ Title:"""
                 "source_filename": source_filename,
             })
 
+        if dropped_nodes:
+            logger.warning(f"Dropped {dropped_nodes} low-quality nodes for source_id={source_id}.")
+
         return {"nodes": normalized_nodes, "edges": normalized_edges}
+
+    @staticmethod
+    def _graph_payload_looks_low_quality(graph_payload: Dict[str, List[Dict[str, Any]]], min_nodes_for_edge_check: int = 4) -> bool:
+        nodes = graph_payload.get("nodes", []) if isinstance(graph_payload, dict) else []
+        edges = graph_payload.get("edges", []) if isinstance(graph_payload, dict) else []
+        if not nodes:
+            return False
+
+        low_quality_nodes = sum(
+            1 for node in nodes
+            if not str(node.get("node_name", "")).strip() or not str(node.get("node_type", "")).strip()
+        )
+        if (low_quality_nodes / max(len(nodes), 1)) > 0.5:
+            return True
+
+        if len(nodes) >= min_nodes_for_edge_check and len(edges) == 0:
+            return True
+
+        return False
 
     def extract_entities_and_relationships(self, text_content: str, source_id: str, source_filename: str = "", max_text_length: int = config.LLM_ENTITY_MAX_INPUT_LENGTH) -> Dict[str, List[Dict]]:
         logger.info(f"Request to extract entities/relationships for source_id: '{source_id}' (original len {len(text_content)}, processing max {max_text_length}).")
@@ -1198,6 +1227,36 @@ Expected JSON shape:
             return {"nodes": [], "edges": []}
 
         normalized = self.normalize_graph_payload(parsed_json, source_id=source_id, source_filename=source_filename)
+
+        if self._graph_payload_looks_low_quality(normalized):
+            logger.warning(
+                f"Low-quality graph extraction detected for '{source_id}' (nodes={len(normalized['nodes'])}, edges={len(normalized['edges'])}). Retrying once with stricter prompt."
+            )
+            strict_graph_prompt = (
+                prompt
+                + "\nImportant: edge endpoints must reference existing nodes consistently via node_id (preferred) or exact node_name."
+                + "\nIf relationships exist in the text, return at least 2 edges."
+                + "\nRespond with JSON only."
+            )
+            retry_text = self._generate_content_with_retry(
+                strict_graph_prompt,
+                temperature=0.0,
+                max_output_tokens=entity_retry_tokens,
+                json_mode=True,
+                validator=_looks_like_entity_graph_json,
+            )
+            retry_json = _parse_candidate(retry_text) if retry_text and not retry_text.startswith("Error:") else None
+            if retry_json:
+                normalized_retry = self.normalize_graph_payload(retry_json, source_id=source_id, source_filename=source_filename)
+                if not self._graph_payload_looks_low_quality(normalized_retry):
+                    normalized = normalized_retry
+                else:
+                    logger.warning(f"Strict retry still low-quality for '{source_id}'. Returning empty graph.")
+                    normalized = {"nodes": [], "edges": []}
+            else:
+                logger.warning(f"Strict retry failed to parse for '{source_id}'. Returning empty graph.")
+                normalized = {"nodes": [], "edges": []}
+
         logger.info(f"Entity extraction success for '{source_id}'. Found {len(normalized['nodes'])} nodes, {len(normalized['edges'])} edges.")
         return normalized
 
