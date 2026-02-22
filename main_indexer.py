@@ -192,6 +192,7 @@ class DocumentIndexer:
 
         all_data_objects, all_nodes, all_edges = [], [], []
         skipped_articles_count = 0
+        chunks_with_no_edges = 0
         source_id = utils.make_source_id_from_filename(filename)
 
         for i, (marker, body) in enumerate(articles_data):
@@ -220,7 +221,8 @@ class DocumentIndexer:
 
             article_uuid: str = utils.generate_legal_article_id(law_document_title, marker, filename)
             entity_source_id: str = str(article_uuid)
-            entities = self.llm_manager.extract_entities_and_relationships(refined_text, entity_source_id, source_filename=filename)
+            llm_text = utils.clean_text(body, is_pre_splitting=False)
+            entities = self.llm_manager.extract_entities_and_relationships(llm_text, entity_source_id, source_filename=filename)
 
             # Upsert objects
             all_data_objects.append({
@@ -267,6 +269,11 @@ class DocumentIndexer:
                             node_props.get("source_id", entity_source_id),
                         ),
                     })
+            nodes_extracted = len(entities.get("nodes", [])) if isinstance(entities, dict) else 0
+            edges_extracted = len(entities.get("edges", [])) if isinstance(entities, dict) else 0
+            nodes_inserted = 0
+            edges_inserted = 0
+
             if entities and isinstance(entities.get("edges"), list):
                 for idx, e in enumerate(entities["edges"]):
                     if not isinstance(e, dict):
@@ -291,17 +298,33 @@ class DocumentIndexer:
                             edge_props["source_id"],
                         ),
                     })
+                    edges_inserted += 1
+
+            nodes_inserted = len([n for n in all_nodes if n["properties"].get("source_id") == entity_source_id])
+            if edges_extracted == 0:
+                chunks_with_no_edges += 1
+                if nodes_extracted > 0:
+                    logger.warning(
+                        f"No edges extracted for '{filename}' article '{marker}' despite {nodes_extracted} nodes. Sample payload: {entities}"
+                    )
+            logger.info(
+                f"Graph extraction stats for '{filename}' article '{marker}': "
+                f"nodes_extracted={nodes_extracted}, edges_extracted={edges_extracted}, "
+                f"nodes_inserted={nodes_inserted}, edges_inserted={edges_inserted}"
+            )
 
             logger.debug(f"Finished article '{marker}' in {time.time() - article_proc_start_time:.2f}s.")
 
             _memnote(f"after article {i+1}/{len(articles_data)} from {filename}")
 
-            del refined_text, embeddings, article_embedding, entities
+            del refined_text, llm_text, embeddings, article_embedding, entities
             if getattr(config, "AGGRESSIVE_MEMORY_CLEANUP", False):
                 self._flush_mem(f"after article {i+1}/{len(articles_data)}")
 
         if articles_data:
             logger.info(f"{skipped_articles_count}/{len(articles_data)} articles skipped for '{filename}'.")
+            if chunks_with_no_edges > max(1, len(articles_data) // 2):
+                logger.warning(f"High no-edge ratio for '{filename}': {chunks_with_no_edges}/{len(articles_data)} articles produced no edges.")
 
         if all_data_objects:
             self.weaviate_manager.upsert_data_objects(
@@ -369,6 +392,7 @@ class DocumentIndexer:
 
         all_data_objects, all_nodes, all_edges = [], [], []
         skipped_chunks_count = 0
+        chunks_with_no_edges = 0
         source_id = utils.make_source_id_from_filename(filename)
 
         for i, ch in enumerate(chunk_dicts):
@@ -404,7 +428,8 @@ class DocumentIndexer:
             chunk_uuid: str = utils.generate_doc_chunk_id_v2(filename, i, page_start, page_end, prop_start, prop_end)
             chunk_id = utils.make_chunk_id(source_id, i, page_start, page_end, prop_start, prop_end)
             entity_source_id: str = str(chunk_uuid)
-            entities = self.llm_manager.extract_entities_and_relationships(refined_text, entity_source_id, source_filename=filename)
+            llm_text = utils.clean_text(chunk_text, is_pre_splitting=False)
+            entities = self.llm_manager.extract_entities_and_relationships(llm_text, entity_source_id, source_filename=filename)
 
             all_data_objects.append({
                 "properties": {
@@ -452,10 +477,15 @@ class DocumentIndexer:
                             node_props.get("source_id", entity_source_id),
                         ),
                     })
+            nodes_extracted = len(entities.get("nodes", [])) if isinstance(entities, dict) else 0
+            edges_extracted = len(entities.get("edges", [])) if isinstance(entities, dict) else 0
+            nodes_inserted = 0
+            edges_inserted = 0
+
             if entities and isinstance(entities.get("edges"), list):
                 for idx, e in enumerate(entities["edges"]):
                     if not isinstance(e, dict):
-                        logger.warning(f"Skipping non-dict edge for '{filename}' article {i} at index {idx}.")
+                        logger.warning(f"Skipping non-dict edge for '{filename}' chunk {i} at index {idx}.")
                         continue
                     edge_props = {
                         "source_entity": str(e.get("source_entity", "")).strip(),
@@ -465,7 +495,7 @@ class DocumentIndexer:
                         "source_filename": filename,
                     }
                     if not edge_props["source_entity"] or not edge_props["target_entity"]:
-                        logger.warning(f"Skipping edge missing endpoints for '{filename}' article {i} at index {idx}.")
+                        logger.warning(f"Skipping edge missing endpoints for '{filename}' chunk {i} at index {idx}.")
                         continue
                     all_edges.append({
                         "properties": edge_props,
@@ -476,17 +506,33 @@ class DocumentIndexer:
                             edge_props["source_id"],
                         ),
                     })
+                    edges_inserted += 1
+
+            nodes_inserted = len([n for n in all_nodes if n["properties"].get("source_id") == entity_source_id])
+            if edges_extracted == 0:
+                chunks_with_no_edges += 1
+                if nodes_extracted > 0:
+                    logger.warning(
+                        f"No edges extracted for '{filename}' chunk {i} despite {nodes_extracted} nodes. Sample payload: {entities}"
+                    )
+            logger.info(
+                f"Graph extraction stats for '{filename}' chunk {i}: "
+                f"nodes_extracted={nodes_extracted}, edges_extracted={edges_extracted}, "
+                f"nodes_inserted={nodes_inserted}, edges_inserted={edges_inserted}"
+            )
 
             logger.debug(f"Finished chunk {i} in {time.time() - chunk_proc_start_time:.2f}s.")
 
             _memnote(f"after chunk {i+1}/{len(chunk_dicts)} from {filename}")
 
-            del refined_text, embeddings, chunk_embedding, entities
+            del refined_text, llm_text, embeddings, chunk_embedding, entities
             if getattr(config, "AGGRESSIVE_MEMORY_CLEANUP", False):
                 self._flush_mem(f"after chunk {i+1}/{len(chunk_dicts)}")
 
         if chunk_dicts:
             logger.info(f"{skipped_chunks_count}/{len(chunk_dicts)} chunks skipped for '{filename}'.")
+            if chunks_with_no_edges > max(1, len(chunk_dicts) // 2):
+                logger.warning(f"High no-edge ratio for '{filename}': {chunks_with_no_edges}/{len(chunk_dicts)} chunks produced no edges.")
 
         if all_data_objects:
             self.weaviate_manager.upsert_data_objects(

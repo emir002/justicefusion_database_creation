@@ -61,6 +61,36 @@ def main() -> int:
         col = client.collections.get(node_class)
 
         # ---- Schema inspection ----
+
+        edge_class = config.WEAVIATE_EDGE_CLASS
+        if not client.collections.exists(edge_class):
+            raise RuntimeError(f"Collection '{edge_class}' does not exist.")
+
+        edge_col = client.collections.get(edge_class)
+        edge_total_count = None
+        try:
+            edge_agg = edge_col.aggregate.over_all(total_count=True)
+            edge_total_count = getattr(edge_agg, "total_count", None)
+        except Exception as e:
+            log.warning("Could not aggregate GraphEdges total_count: %s", e)
+
+        if edge_total_count is not None:
+            log.info("GraphEdges total_count: %s", edge_total_count)
+        else:
+            log.info("GraphEdges total_count: (unknown)")
+
+        try:
+            edge_res = edge_col.query.fetch_objects(
+                limit=5,
+                return_properties=["source_entity", "target_entity", "relationship_type", "source_id", "source_filename"],
+            )
+            edge_objs = getattr(edge_res, "objects", []) or []
+            log.info("Fetched %d GraphEdges objects (sample).", len(edge_objs))
+            for i, o in enumerate(edge_objs[:5], start=1):
+                props = getattr(o, "properties", {}) or {}
+                log.info("GraphEdge sample #%d props: %s", i, props)
+        except Exception as e:
+            raise RuntimeError(f"FAIL: GraphEdges fetch_objects failed: {e}")
         cfg = col.config.get()
         prop_names = [p.name for p in getattr(cfg, "properties", [])]
         log.info("GraphNodes properties: %s", prop_names)

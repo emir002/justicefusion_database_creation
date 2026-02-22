@@ -501,6 +501,9 @@ class WeaviateManager:
             if num_server_side_failures > 0:
                 metrics.WEAVIATE_UPSERTS_FAILED_SERVER_SIDE.labels(collection=collection_name).inc(num_server_side_failures)
                 logger.warning(f"{num_server_side_failures} objects failed server-side during batch to '{collection_name}'. Errors from failed_objects: {server_side_errors_list[:3]}")
+                if collection_name == config.WEAVIATE_EDGE_CLASS:
+                    for failed_obj in server_side_errors_list[:5]:
+                        logger.warning(f"GraphEdges failed_object: {failed_obj}")
 
             logger.info(
                 f"Batch to '{collection_name}' finished. Sent: {successfully_added_to_batch_count - client_side_failures}. "

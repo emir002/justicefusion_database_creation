@@ -153,23 +153,17 @@ def generate_graph_node_id(entity_name: str, entity_type: str, source_id: str) -
 def generate_graph_edge_id(source_entity_name: str,
                            target_entity_name: str,
                            relationship_type: str,
-                           source_id: str) -> str: # source_id is kept for signature compatibility, not used in ID generation
+                           source_id: str) -> str:
     """
-    Creates a canonical/deterministic UUID string so that identical edges found across
-    different documents will collapse onto the same Weaviate object.
+    Creates a deterministic UUID string for a graph edge, scoped by source_id.
+    This keeps edges stable for re-indexing while avoiding cross-document collisions.
     """
-    # Canonical ordering treats the edge as undirected for identity purposes.
     src = source_entity_name.strip().lower()
     tgt = target_entity_name.strip().lower()
-    if src <= tgt:
-        left, right = src, tgt
-    else:
-        left, right = tgt, src
-
     rel = relationship_type.strip().lower().replace(" ", "_")
-    
-    # The identifier intentionally excludes source_id to ensure deduplication.
-    canonical_identifier = f"graph_edge::from:{left}::to:{right}::rel:{rel}"
+    src_id = source_id.strip()
+
+    canonical_identifier = f"graph_edge::source_id:{src_id}::from:{src}::to:{tgt}::rel:{rel}"
     return generate_uuid_from_string(canonical_identifier)
 
 # --- JSON Handling ---
