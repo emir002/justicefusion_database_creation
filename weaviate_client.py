@@ -19,6 +19,7 @@ from weaviate.collections.classes.filters import Filter
 import config
 import utils
 import metrics
+from db_connection_diagnostics import build_diagnostics_report
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +33,19 @@ class WeaviateManager:
         logger.info(f"Initializing WeaviateManager in '{run_mode}' mode.")
         self.run_mode = run_mode
         self.client: Optional[WeaviateClient] = self._connect()
+        should_log_diagnostics = os.getenv("DEBUG_DB_DIAGNOSTICS", "0").strip().lower() in {"1", "true", "yes"}
+        if should_log_diagnostics:
+            logger.info("DEBUG_DB_DIAGNOSTICS enabled. Printing Weaviate diagnostics report once.")
+            logger.info("\n%s", self.diagnostics_report())
         if self.client:
             self._ensure_schema()
             logger.info("WeaviateManager initialized successfully.")
         else:
             logger.error("WeaviateManager initialization failed: Could not connect to Weaviate.")
+
+    def diagnostics_report(self) -> str:
+        """Return a structured, non-secret Weaviate diagnostics report."""
+        return build_diagnostics_report()
 
     def _connect(self) -> Optional[WeaviateClient]:
         logger.info(
