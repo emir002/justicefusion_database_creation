@@ -176,7 +176,7 @@ GEMINI_MODEL_NAME = "gemini-2.5-flash-lite"
 
 # Choose the local Ollama model name by typing it here.
 # (Requested default for local-only usage)
-LOCAL_LLM_MODEL_NAME = "gpt-oss:20b"
+LOCAL_LLM_MODEL_NAME = "qwen2.5:14b-instruct-q6_K"
 
 # Ollama endpoint (OpenAI-style model server is NOT used here; this is Ollama's HTTP API).
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -224,7 +224,7 @@ LLM_TITLE_SNIPPET_MAX_LEN = 2000     # Max characters from start of doc for titl
 LLM_ENTITY_MAX_INPUT_LENGTH = int(os.getenv("LLM_ENTITY_MAX_INPUT_LENGTH", "3000"))
 # Keep JSON tasks deterministic and give graph extraction enough output budget.
 LLM_ENTITY_EXTRACTION_TEMPERATURE = float(os.getenv("LLM_ENTITY_EXTRACTION_TEMPERATURE", "0.1"))
-LLM_ENTITY_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_ENTITY_EXTRACTION_MAX_OUTPUT_TOKENS", "3072"))
+LLM_ENTITY_EXTRACTION_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_ENTITY_EXTRACTION_MAX_OUTPUT_TOKENS", "1024"))
 LLM_ENTITY_EXTRACTION_RETRY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_ENTITY_EXTRACTION_RETRY_MAX_OUTPUT_TOKENS", "4096"))
 
 # -----------------------------------------------------------------------------
