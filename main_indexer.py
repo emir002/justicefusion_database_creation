@@ -14,6 +14,7 @@ import gc
 import shutil
 import psutil
 import os
+import socket
 import faulthandler
 faulthandler.enable(file=open("fatal_crash.log", "w"))
 
@@ -146,9 +147,35 @@ class DocumentIndexer:
             torch.cuda.empty_cache()
             logger.debug("Cleared PyTorch CUDA cache.")
 
+
+    @staticmethod
+    def _port_reachability(host: str, port: int, timeout: int = 3) -> str:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return "PASS"
+        except Exception as exc:
+            return f"FAIL ({type(exc).__name__}: {exc})"
+
+    def _log_weaviate_connection_failure_diagnostics(self):
+        http_scheme = "https" if config.WEAVIATE_SECURE else "http"
+        grpc_scheme = "grpcs" if config.WEAVIATE_GRPC_SECURE else "grpc"
+        http_endpoint = f"{http_scheme}://{config.WEAVIATE_HOST}:{config.WEAVIATE_PORT}"
+        grpc_endpoint = f"{grpc_scheme}://{config.WEAVIATE_GRPC_HOST}:{config.WEAVIATE_GRPC_PORT}"
+
+        http_reach = self._port_reachability(config.WEAVIATE_HOST, config.WEAVIATE_PORT)
+        grpc_reach = self._port_reachability(config.WEAVIATE_GRPC_HOST, config.WEAVIATE_GRPC_PORT)
+
+        logger.error("Weaviate connectivity diagnostics:")
+        logger.error(f"  HTTP endpoint: {http_endpoint} (secure={config.WEAVIATE_SECURE})")
+        logger.error(f"  gRPC endpoint: {grpc_endpoint} (secure={config.WEAVIATE_GRPC_SECURE})")
+        logger.error(f"  Reachability HTTP {config.WEAVIATE_HOST}:{config.WEAVIATE_PORT}: {http_reach}")
+        logger.error(f"  Reachability gRPC {config.WEAVIATE_GRPC_HOST}:{config.WEAVIATE_GRPC_PORT}: {grpc_reach}")
+        logger.error("Hint: run `python db_connection_diagnostics.py` for a full report.")
+
     def _validate_initialization(self):
         logger.info("Performing post-initialization validation of core components...")
         if not self.weaviate_manager or not self.weaviate_manager.is_connected():
+            self._log_weaviate_connection_failure_diagnostics()
             raise ConnectionError("Critical component failure: Weaviate connection is not established.")
         logger.info("Validation OK: WeaviateManager is connected.")
 

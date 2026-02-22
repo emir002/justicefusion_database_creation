@@ -249,7 +249,20 @@ WEAVIATE_PORT = int(os.getenv("WEAVIATE_PORT", "8080"))
 WEAVIATE_SECURE = os.getenv("WEAVIATE_SECURE", "false").lower() == "true"
 WEAVIATE_GRPC_HOST = os.getenv("WEAVIATE_GRPC_HOST", "localhost")
 WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
-WEAVIATE_GRPC_SECURE = os.getenv("WEAVIATE_GRPC_GRPC_SECURE", "false").lower() == "true" if os.getenv("WEAVIATE_GRPC_GRPC_SECURE") else os.getenv("WEAVIATE_GRPC_SECURE", "false").lower() == "true"
+_weaviate_grpc_secure_value = os.getenv("WEAVIATE_GRPC_SECURE")
+_weaviate_grpc_typo_secure_value = os.getenv("WEAVIATE_GRPC_GRPC_SECURE")
+if _weaviate_grpc_typo_secure_value is not None:
+    logger.warning(
+        "Detected env var WEAVIATE_GRPC_GRPC_SECURE (likely typo). "
+        "Prefer WEAVIATE_GRPC_SECURE. Canonical resolution uses WEAVIATE_GRPC_SECURE first, "
+        "then falls back to WEAVIATE_GRPC_GRPC_SECURE for backwards compatibility."
+    )
+_resolved_weaviate_grpc_secure_raw = (
+    _weaviate_grpc_secure_value
+    if _weaviate_grpc_secure_value is not None
+    else (_weaviate_grpc_typo_secure_value if _weaviate_grpc_typo_secure_value is not None else "false")
+)
+WEAVIATE_GRPC_SECURE = str(_resolved_weaviate_grpc_secure_raw).strip().lower() == "true"
 logger.info(f"Weaviate HTTP: host={WEAVIATE_HOST}, port={WEAVIATE_PORT}, secure={WEAVIATE_SECURE}")
 logger.info(f"Weaviate gRPC: host={WEAVIATE_GRPC_HOST}, port={WEAVIATE_GRPC_PORT}, secure={WEAVIATE_GRPC_SECURE}")
 
