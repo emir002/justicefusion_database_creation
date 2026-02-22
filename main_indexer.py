@@ -620,9 +620,15 @@ class DocumentIndexer:
 
                 temp_text_for_classification = utils.clean_text(original_full_text, is_pre_splitting=True)
                 classification_snippet = temp_text_for_classification[:config.LLM_CLASSIFICATION_SNIPPET_MAX_LEN]
+                if getattr(config, "DEBUG", False):
+                    logger.debug(
+                        "Classification snippet selected | filename='%s' | snippet='%s'",
+                        file_path.name,
+                        classification_snippet[:300].replace("\n", " "),
+                    )
 
                 doc_type = ""
-                doc_type = self.llm_manager.classify_document(classification_snippet)
+                doc_type = self.llm_manager.classify_document(classification_snippet, filename=file_path.name)
 
                 logger.info(f"Document '{file_path.name}' classified as: '{doc_type}'.")
 

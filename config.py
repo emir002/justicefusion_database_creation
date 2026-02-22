@@ -23,6 +23,8 @@ import torch
 
 logger = logging.getLogger(__name__)  # Module logger
 
+DEBUG = os.getenv("DEBUG", "0").strip().lower() in {"1", "true", "yes"}
+
 
 # -----------------------------------------------------------------------------
 # General

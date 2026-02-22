@@ -274,6 +274,66 @@ class LLMManager:
                 f"Per-key input token limit enabled: {self._token_limit} tokens/minute per key."
             )
 
+    @staticmethod
+    def _contains_commentary_markers(text: str) -> bool:
+        lowered = (text or "").lower()
+        commentary_markers = (
+            "komentar",
+            "pojašnjenje",
+            "pojasnjenje",
+            "tumačenje",
+            "tumacenje",
+            "mišljenje",
+            "misljenje",
+            "analiza",
+            "faq",
+            "primjer",
+            "primer",
+            "obrazloženje",
+            "obrazlozenje",
+            "osvrt",
+            "u praksi",
+        )
+        return any(marker in lowered for marker in commentary_markers)
+
+    def looks_like_pure_law(self, text_snippet: str, filename: str = "") -> bool:
+        normalized_filename = (filename or "").lower()
+        filename_is_law_article = (
+            ("zakon" in normalized_filename)
+            and ("član" in normalized_filename or "clan" in normalized_filename)
+            and bool(re.search(r"\b\d+\b", normalized_filename))
+        )
+        if not filename_is_law_article:
+            return False
+
+        snippet = text_snippet or ""
+        snippet_has_legal_structure = any(
+            marker in snippet.lower()
+            for marker in ("član", "clan", "članak", "clanak", "stav", "tačka", "tacka")
+        ) or bool(re.search(r"\(\d+\)", snippet))
+
+        if not snippet_has_legal_structure:
+            return False
+
+        return not self._contains_commentary_markers(snippet)
+
+    @staticmethod
+    def _apply_known_title_fixups(title: str) -> str:
+        cleaned = (title or "").strip()
+        if not cleaned:
+            return cleaned
+        return cleaned.replace("Zakon o javnim nabavkam", "Zakon o javnim nabavkama")
+
+    @staticmethod
+    def _enforce_known_law_title(title: str, text: str, original_filename: Optional[str]) -> str:
+        known_title = "Zakon o javnim nabavkama"
+        sources = [text or "", original_filename or ""]
+        if any(known_title in source for source in sources):
+            if known_title in (title or ""):
+                return title
+            return known_title
+        return title
+
     def _estimate_input_tokens(self, prompt: str) -> int:
         """Rough heuristic for counting prompt tokens for rate tracking."""
         if not prompt:
@@ -960,10 +1020,14 @@ Title:"""
             cleaned_title = _clean_title(retry_title or "") if retry_title and not retry_title.startswith("Error:") else ""
 
         if cleaned_title:
+            cleaned_title = self._apply_known_title_fixups(cleaned_title)
+            cleaned_title = self._enforce_known_law_title(cleaned_title, snippet, original_filename)
             logger.info(f"Document title extracted/generated: '{cleaned_title}'")
             return cleaned_title
 
         fallback = _filename_fallback()
+        fallback = self._apply_known_title_fixups(fallback)
+        fallback = self._enforce_known_law_title(fallback, snippet, original_filename)
         logger.warning(f"Failed to extract/generate title from LLM; fallback='{fallback}'")
         return fallback
 
@@ -1137,10 +1201,24 @@ Expected JSON shape:
         logger.info(f"Entity extraction success for '{source_id}'. Found {len(normalized['nodes'])} nodes, {len(normalized['edges'])} edges.")
         return normalized
 
-    def classify_document(self, text_snippet: str) -> str:
+    def classify_document(self, text_snippet: str, filename: Optional[str] = None) -> str:
         if not text_snippet.strip():
             logger.warning("Empty snippet for classification – defaulting to OTHER.")
             return "OTHER"
+
+        if getattr(config, "DEBUG", False):
+            debug_snippet = text_snippet[:300].replace("\n", " ")
+            logger.debug(
+                "Classifier input | filename='%s' | snippet='%s'",
+                filename or "",
+                debug_snippet,
+            )
+
+        if self.looks_like_pure_law(text_snippet=text_snippet, filename=filename or ""):
+            logger.info("Classifier override -> LAW (heuristic)")
+            if getattr(config, "DEBUG", False):
+                logger.debug("Classifier final label | filename='%s' | label='LAW'", filename or "")
+            return "LAW"
 
         def _extract_label(value: str) -> str:
             if not value:
@@ -1151,7 +1229,7 @@ Expected JSON shape:
 
         prompt = f"""Analyze the following text snippet and classify it into one of three categories: LAW, MIXED, or OTHER.
 
-- **LAW**: The text is purely legislative or regulatory content (e.g., a law, regulation, statute). It consists of articles, sections, and formal legal language.
+- **LAW**: The text is purely legislative or regulatory content (e.g., a law, regulation, statute). It consists of articles, sections, and formal legal language. A single article of a law (for example one "Član"/"Članak" with one or more "stav") is still LAW even if it has a short heading.
 - **MIXED**: The text contains both legislative/regulatory content AND additional commentary, analysis, news, or explanations. For example, a news article that quotes several articles of a law.
 - **OTHER**: The text is not a legal document. Examples include news reports, court summaries (not the full text of the decision), academic papers, or general web content.
 
@@ -1162,7 +1240,7 @@ Expected JSON shape:
 
 **OUTPUT:**
 Return only a single word: LAW, MIXED, or OTHER."""
-        reply = self._generate_content_with_retry(prompt, temperature=0.0, max_output_tokens=64, validator=lambda x: bool(_extract_label(x)))
+        reply = self._generate_content_with_retry(prompt, temperature=0.0, max_output_tokens=4, validator=lambda x: bool(_extract_label(x)))
         label = _extract_label(reply or "") if reply and not reply.startswith("Error:") else ""
 
         if not label:
@@ -1170,11 +1248,13 @@ Return only a single word: LAW, MIXED, or OTHER."""
                 "Respond with ONLY one token: LAW or MIXED or OTHER. No punctuation. No explanation.\n\n"
                 f"TEXT:\n{text_snippet}"
             )
-            reply = self._generate_content_with_retry(hardened_prompt, temperature=0.0, max_output_tokens=64, validator=lambda x: bool(_extract_label(x)))
+            reply = self._generate_content_with_retry(hardened_prompt, temperature=0.0, max_output_tokens=4, validator=lambda x: bool(_extract_label(x)))
             label = _extract_label(reply or "") if reply and not reply.startswith("Error:") else ""
 
         if label:
             logger.info(f"Document snippet classified as '{label}'.")
+            if getattr(config, "DEBUG", False):
+                logger.debug("Classifier final label | filename='%s' | label='%s'", filename or "", label)
             return label
 
         logger.error(f"Classifier LLM failed after retry: {reply}. Defaulting to OTHER.")
