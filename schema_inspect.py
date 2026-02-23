@@ -86,6 +86,7 @@ logging.getLogger("pdfminer").setLevel(logging.ERROR)
 logging.getLogger("pdfminer.pdfpage").setLevel(logging.ERROR)
 # -----------------------------------------
 
+
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
@@ -257,6 +258,24 @@ def endpoint_style_stats(edges: List[Dict[str, Any]]) -> Dict[str, Any]:
         "nx_like": nx_like,
         "nx_like_pct": round(100.0 * nx_like / max(1, len(endpoints)), 2),
     }
+
+
+# --- ADDED (minimal): verify new edge fields are present and non-empty in samples ---
+def non_empty_field_stats(rows: List[Dict[str, Any]], fields: List[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"sample_size": len(rows), "fields": {}}
+    for f in fields:
+        non_empty = 0
+        for r in rows:
+            v = r.get(f, None)
+            s = str(v).strip() if v is not None else ""
+            if s:
+                non_empty += 1
+        out["fields"][f] = {
+            "non_empty": non_empty,
+            "pct": round(100.0 * non_empty / max(1, len(rows)), 2),
+        }
+    return out
+# -------------------------------------------------------------------------------
 
 
 def build_nodes_index_by_group(
@@ -644,14 +663,31 @@ def main() -> int:
         report_collection(art_class, art_col, ["law_title", "article_number", "source_id"])
         node_sample_props = ["node_name", "node_type", "description", "source_id", "source_filename"] + (["node_id"] if node_has_node_id else [])
         report_collection(node_class, node_col, node_sample_props)
-        report_collection(edge_class, edge_col, ["source_entity", "target_entity", "relationship_type", "source_id", "source_filename"])
+
+        # --- CHANGED (minimal): include new GraphEdges fields in sample ---
+        report_collection(
+            edge_class,
+            edge_col,
+            [
+                "source_entity", "target_entity", "relationship_type", "source_id", "source_filename",
+                "source_node_id", "target_node_id", "source_node_key", "target_node_key",
+            ],
+        )
 
         if (aggregate_count(art_col) or 0) == 0:
             print("\nWARNING: LegalArticle is empty. This means law ingestion/classification likely isn't populating LegalArticle.", flush=True)
 
         p("Step 5: GraphEdges endpoint style + samples")
 
-        edge_samples = fetch_objects(edge_col, ["source_entity", "target_entity", "relationship_type", "source_id", "source_filename"], limit=10)
+        # --- CHANGED (minimal): include new edge fields in samples ---
+        edge_samples = fetch_objects(
+            edge_col,
+            [
+                "source_entity", "target_entity", "relationship_type", "source_id", "source_filename",
+                "source_node_id", "target_node_id", "source_node_key", "target_node_key",
+            ],
+            limit=10,
+        )
         print(f"Fetched {len(edge_samples)} edge samples:", flush=True)
         for i, e in enumerate(edge_samples, 1):
             print(f"  Edge#{i}: {e}", flush=True)
@@ -664,6 +700,16 @@ def main() -> int:
                 "         If your UI joins by node_name or UUID, edges will appear disconnected.",
                 flush=True
             )
+
+        # --- ADDED (minimal): verify new edge fields are NOT empty in the sample ---
+        new_edge_fields = ["source_node_id", "target_node_id", "source_node_key", "target_node_key"]
+        print("\nNew edge fields non-empty stats (sample=10):", flush=True)
+        print(json.dumps(non_empty_field_stats(edge_samples, new_edge_fields), indent=2), flush=True)
+        # warn if any are empty across the sample
+        stats = non_empty_field_stats(edge_samples, new_edge_fields)
+        for f, info in (stats.get("fields", {}) or {}).items():
+            if info.get("non_empty", 0) == 0:
+                print(f"WARNING: Field '{f}' is empty for all sampled edges. Indexer may not be populating it.", flush=True)
 
         p("Step 6: CRITICAL edge->node join integrity")
 
